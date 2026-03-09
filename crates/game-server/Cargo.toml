@@ -1,0 +1,26 @@
+[package]
+name = "game-server"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "game-server"
+path = "src/main.rs"
+
+[dependencies]
+common = { path = "../common" }
+protocol = { path = "../protocol" }
+world = { path = "../world" }
+gateway = { path = "../gateway" }
+admin = { path = "../admin" }
+services = { path = "../services" }
+game-data = { path = "../game-data" }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+serde = { workspace = true }
+
+[dev-dependencies]
+tokio-test = { workspace = true }
