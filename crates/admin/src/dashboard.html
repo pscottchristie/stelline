@@ -1,0 +1,344 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Stelline Admin Dashboard</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  :root {
+    --bg:        #0d1117;
+    --surface:   #161b22;
+    --border:    #30363d;
+    --text:      #c9d1d9;
+    --muted:     #8b949e;
+    --accent:    #58a6ff;
+    --green:     #3fb950;
+    --red:       #f85149;
+    --yellow:    #d29922;
+    --font:      'Courier New', Courier, monospace;
+  }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--font);
+    font-size: 14px;
+    line-height: 1.5;
+    padding: 24px;
+    min-height: 100vh;
+  }
+
+  header {
+    display: flex;
+    align-items: baseline;
+    gap: 16px;
+    margin-bottom: 24px;
+    border-bottom: 1px solid var(--border);
+    padding-bottom: 12px;
+  }
+
+  header h1 {
+    font-size: 20px;
+    color: var(--accent);
+    letter-spacing: 1px;
+    text-transform: uppercase;
+  }
+
+  #status-badge {
+    font-size: 12px;
+    padding: 2px 8px;
+    border-radius: 10px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    color: var(--muted);
+  }
+
+  #status-badge.connected    { border-color: var(--green); color: var(--green); }
+  #status-badge.connecting   { border-color: var(--yellow); color: var(--yellow); }
+  #status-badge.disconnected { border-color: var(--red); color: var(--red); }
+
+  #last-updated {
+    margin-left: auto;
+    font-size: 12px;
+    color: var(--muted);
+  }
+
+  .panel {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    margin-bottom: 20px;
+    overflow: hidden;
+  }
+
+  .panel-title {
+    padding: 10px 16px;
+    font-size: 12px;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    color: var(--muted);
+    border-bottom: 1px solid var(--border);
+    background: var(--bg);
+  }
+
+  .panel-body {
+    padding: 16px;
+  }
+
+  .stat-row {
+    display: flex;
+    gap: 32px;
+    flex-wrap: wrap;
+  }
+
+  .stat {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+
+  .stat-label {
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: var(--muted);
+  }
+
+  .stat-value {
+    font-size: 22px;
+    color: var(--accent);
+  }
+
+  table {
+    width: 100%;
+    border-collapse: collapse;
+  }
+
+  th {
+    text-align: left;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: var(--muted);
+    padding: 6px 10px;
+    border-bottom: 1px solid var(--border);
+  }
+
+  td {
+    padding: 8px 10px;
+    border-bottom: 1px solid var(--border);
+    vertical-align: middle;
+  }
+
+  tr:last-child td { border-bottom: none; }
+
+  tr:hover td { background: rgba(88, 166, 255, 0.04); }
+
+  .tick-rate-ok   { color: var(--green); }
+  .tick-rate-warn { color: var(--yellow); }
+  .tick-rate-bad  { color: var(--red); }
+
+  .zone-name { color: var(--text); font-weight: bold; }
+
+  #placeholder {
+    text-align: center;
+    padding: 40px;
+    color: var(--muted);
+    font-size: 16px;
+  }
+
+  #placeholder.hidden { display: none; }
+
+  #dashboard.hidden { display: none; }
+
+  .dot {
+    display: inline-block;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    margin-right: 6px;
+  }
+  .dot.green { background: var(--green); }
+  .dot.red   { background: var(--red); }
+  .dot.yellow { background: var(--yellow); }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>Stelline Admin</h1>
+  <span id="status-badge" class="connecting">Connecting...</span>
+  <span id="last-updated"></span>
+</header>
+
+<div id="placeholder">
+  <span class="dot yellow"></span>Waiting for server data...
+</div>
+
+<div id="dashboard" class="hidden">
+
+  <div class="panel">
+    <div class="panel-title">Server Overview</div>
+    <div class="panel-body">
+      <div class="stat-row">
+        <div class="stat">
+          <span class="stat-label">Uptime</span>
+          <span class="stat-value" id="uptime">--:--:--</span>
+        </div>
+        <div class="stat">
+          <span class="stat-label">Connected Players</span>
+          <span class="stat-value" id="connected-players">0</span>
+        </div>
+        <div class="stat">
+          <span class="stat-label">Active Zones</span>
+          <span class="stat-value" id="zone-count">0</span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="panel">
+    <div class="panel-title">Zones</div>
+    <div class="panel-body" style="padding: 0;">
+      <table id="zone-table">
+        <thead>
+          <tr>
+            <th>Zone</th>
+            <th>Players</th>
+            <th>Entities</th>
+            <th>Tick Rate</th>
+            <th>Avg Tick (ms)</th>
+            <th>Max Tick (ms)</th>
+            <th>Health</th>
+          </tr>
+        </thead>
+        <tbody id="zone-tbody">
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+</div>
+
+<script>
+(function () {
+  'use strict';
+
+  const statusBadge   = document.getElementById('status-badge');
+  const lastUpdated   = document.getElementById('last-updated');
+  const placeholder   = document.getElementById('placeholder');
+  const dashboard     = document.getElementById('dashboard');
+  const uptime        = document.getElementById('uptime');
+  const connPlayers   = document.getElementById('connected-players');
+  const zoneCount     = document.getElementById('zone-count');
+  const zoneTbody     = document.getElementById('zone-tbody');
+
+  let retryDelay = 500;
+  const MAX_RETRY = 5000;
+
+  function formatUptime(secs) {
+    const h = Math.floor(secs / 3600);
+    const m = Math.floor((secs % 3600) / 60);
+    const s = secs % 60;
+    return [h, m, s].map(n => String(n).padStart(2, '0')).join(':');
+  }
+
+  function tickRateClass(rate) {
+    if (rate >= 19) return 'tick-rate-ok';
+    if (rate >= 18) return 'tick-rate-warn';
+    return 'tick-rate-bad';
+  }
+
+  function tickRateDot(rate) {
+    if (rate >= 19) return 'green';
+    if (rate >= 18) return 'yellow';
+    return 'red';
+  }
+
+  function renderSnapshot(snap) {
+    uptime.textContent      = formatUptime(snap.uptime_secs);
+    connPlayers.textContent = snap.connected_players;
+    zoneCount.textContent   = snap.zones.length;
+
+    zoneTbody.innerHTML = '';
+    snap.zones.forEach(function (z) {
+      const tr     = document.createElement('tr');
+      const cls    = tickRateClass(z.tick_rate);
+      const dot    = tickRateDot(z.tick_rate);
+      const rateStr = z.tick_rate.toFixed(1);
+      const avgStr  = z.tick_duration_ms_avg.toFixed(2);
+      const maxStr  = z.tick_duration_ms_max.toFixed(2);
+
+      tr.innerHTML = [
+        '<td class="zone-name">' + escHtml(z.name) + '</td>',
+        '<td>' + z.player_count + '</td>',
+        '<td>' + z.entity_count + '</td>',
+        '<td class="' + cls + '">' + rateStr + '</td>',
+        '<td>' + avgStr + '</td>',
+        '<td>' + maxStr + '</td>',
+        '<td><span class="dot ' + dot + '"></span></td>',
+      ].join('');
+
+      zoneTbody.appendChild(tr);
+    });
+
+    placeholder.classList.add('hidden');
+    dashboard.classList.remove('hidden');
+
+    const now = new Date();
+    lastUpdated.textContent = 'Updated ' + now.toLocaleTimeString();
+  }
+
+  function escHtml(str) {
+    return String(str)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;');
+  }
+
+  function setStatus(state, label) {
+    statusBadge.className = state;
+    statusBadge.textContent = label;
+  }
+
+  function connect() {
+    const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const url   = proto + '//' + location.host + '/admin/ws';
+    const ws    = new WebSocket(url);
+
+    ws.addEventListener('open', function () {
+      setStatus('connected', 'Connected');
+      retryDelay = 500;
+    });
+
+    ws.addEventListener('message', function (evt) {
+      try {
+        const snap = JSON.parse(evt.data);
+        renderSnapshot(snap);
+      } catch (e) {
+        console.error('Failed to parse snapshot:', e);
+      }
+    });
+
+    ws.addEventListener('close', function () {
+      setStatus('disconnected', 'Disconnected — reconnecting in ' + (retryDelay / 1000).toFixed(1) + 's');
+      setTimeout(function () {
+        setStatus('connecting', 'Connecting...');
+        connect();
+      }, retryDelay);
+      retryDelay = Math.min(retryDelay * 2, MAX_RETRY);
+    });
+
+    ws.addEventListener('error', function () {
+      ws.close();
+    });
+  }
+
+  connect();
+}());
+</script>
+</body>
+</html>

@@ -49,6 +49,9 @@ redis = { version = "0.24", features = ["tokio-comp"] }
 # Spatial / ECS
 hecs = "0.10"
 
+# Config
+toml = "0.8"
+
 # Misc
 uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
@@ -56,3 +59,4 @@ bytes = "1"
 
 # Testing
 tokio-test = "0.4"
+tempfile = "3"

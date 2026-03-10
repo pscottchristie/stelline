@@ -16,3 +16,5 @@ anyhow = { workspace = true }
 [dev-dependencies]
 tokio-test = { workspace = true }
 axum-test = "14"
+tokio-tungstenite = "0.24"
+futures-util = "0.3"
