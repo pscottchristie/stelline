@@ -1,0 +1,19 @@
+[package]
+name = "test-client"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "test-client"
+path = "src/main.rs"
+
+[dependencies]
+common = { path = "../common" }
+protocol = { path = "../protocol" }
+gateway = { path = "../gateway" }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+bincode = { workspace = true }
+bytes = { workspace = true }

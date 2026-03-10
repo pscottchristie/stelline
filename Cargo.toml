@@ -9,6 +9,7 @@ members = [
     "crates/game-data",
     "crates/auth-server",
     "crates/game-server",
+    "crates/test-client",
 ]
 resolver = "2"
 
