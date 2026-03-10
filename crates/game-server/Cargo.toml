@@ -3,6 +3,10 @@ name = "game-server"
 version = "0.1.0"
 edition = "2021"
 
+[lib]
+name = "game_server"
+path = "src/lib.rs"
+
 [[bin]]
 name = "game-server"
 path = "src/main.rs"
@@ -24,3 +28,10 @@ serde = { workspace = true }
 
 [dev-dependencies]
 tokio-test = { workspace = true }
+# Integration tests need direct access to these crates' types.
+protocol = { path = "../protocol" }
+world = { path = "../world" }
+gateway = { path = "../gateway" }
+admin = { path = "../admin" }
+game-data = { path = "../game-data" }
+common = { path = "../common" }
