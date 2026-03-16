@@ -36,7 +36,7 @@ Migrating to bevy_ecs later is straightforward if we need intra-tick parallelism
 ## Process Architecture
 
 ### Two binaries
-- **auth-server**: login, bcrypt password check, JWT issuance, realm list. No game logic.
+- **login-server**: login, bcrypt password check, JWT issuance, realm list. No game logic.
 - **game-server**: validates JWT on connect, runs ECS world. No credential management.
 
 ### Token flow
@@ -323,7 +323,7 @@ pub enum ServerMessage {
 stelline/
 ├── Cargo.toml              # workspace root
 └── crates/
-    ├── auth-server/        # binary: login, JWT, realm list
+    ├── login-server/        # binary: login, JWT, realm list
     ├── game-server/        # binary: composition root — wires Tokio runtime,
     │                       #   spawns zone threads, owns CancellationToken
     │
@@ -348,7 +348,7 @@ stelline/
 
 ### Dependency graph (no circular deps)
 ```
-auth-server   ──► common, protocol
+login-server   ──► common, protocol
 game-server   ──► world, gateway, services, admin, game-data, common, protocol
 gateway       ──► protocol, common
 services      ──► common, protocol  (+ sqlx, redis)
@@ -397,20 +397,23 @@ pub trait CharacterRepository: Send + Sync {
 ## Build Phases
 
 ### Phase 1 — Foundation
-- [ ] Cargo workspace scaffold (all crates, dependency graph)
-- [ ] `common`: EntityId, Vec3, ZoneId, AdminSnapshot primitives
-- [ ] `protocol`: packet header (versioned), core message types, bincode serialization
-- [ ] `world::Zone`: hecs world, tick loop, inbox drain, basic movement, telemetry events
-- [ ] `gateway`: TCP listener, session state machine, channel bridge
-- [ ] `admin`: axum server, WebSocket push, embedded dashboard HTML/JS
-- [ ] `game-server`: spawn zone thread, wire Gateway ↔ Zone ↔ Admin, CancellationToken
-- [ ] On startup: print admin URL to stdout
-- [ ] End-to-end: connect, move, see position update + live stats in dashboard
+- [x] Cargo workspace scaffold (all crates, dependency graph)
+- [x] `common`: EntityId, Vec3, ZoneId, AdminSnapshot primitives
+- [x] `protocol`: packet header (versioned), core message types, bincode serialization
+- [x] `world::Zone`: hecs world, tick loop, inbox drain, basic movement, telemetry events
+- [x] `gateway`: TCP listener, session state machine, channel bridge
+- [x] `admin`: axum server, WebSocket push, embedded dashboard HTML/JS
+- [x] `game-server`: spawn zone thread, wire Gateway ↔ Zone ↔ Admin, CancellationToken
+- [x] On startup: print admin URL to stdout
+- [x] End-to-end: connect, move, see position update + live stats in dashboard
 
-### Phase 2 — Auth
-- [ ] `auth-server`: account DB schema, bcrypt, JWT issuance, realm list
-- [ ] Game server JWT validation + Redis blocklist on connect
-- [ ] Character create/select/delete
+### Phase 2 — Auth & Characters
+- [x] `login-server`: account DB schema, bcrypt, JWT issuance, realm list
+- [x] Game server JWT validation + Redis blocklist on connect
+- [x] Character create/select/delete (DB-backed + in-memory for dev)
+- [x] Three-phase connection protocol: Handshake → Character Selection → Connected
+- [x] Character CRUD HTTP endpoints on login-server
+- [x] `dotenvy` for `.env` file loading (no manual env var exports needed)
 
 ### Phase 3 — World
 - [ ] WorldCoordinator: zone transfer logic, service feedback routing, telemetry aggregation

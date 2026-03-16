@@ -8,14 +8,50 @@
 //! - `run_tcp_listener`      — accepts TCP connections and spawns tasks.
 //! - `run_immediate_router`  — forwards gateway commands to zone inboxes.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::mpsc as std_mpsc;
+use std::time::Duration;
 
-use common::{AdminSnapshot, EntityId, Vec3, ZoneId};
-use gateway::{ConnectionConfig, UdpPacket};
-use tokio::sync::{mpsc, watch};
+use common::{AdminSnapshot, EntityId, ZoneEntitySnapshot, ZoneId};
+use gateway::{ConnectionConfig, EnterZoneRequest, GatewayAuth, UdpPacket};
+use tokio::sync::{mpsc, oneshot, watch};
 use tracing::{error, info, warn};
-use world::{Zone, ZoneCommand, ZoneEvent};
+use world::{ZoneCommand, ZoneEvent};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Connection registry — tracks which accounts are currently connected
+// ─────────────────────────────────────────────────────────────────────────────
+
+enum RegistryMsg {
+    TryRegister {
+        account_uuid: String,
+        reply: oneshot::Sender<bool>,
+    },
+    Unregister {
+        account_uuid: String,
+    },
+}
+
+/// Spawn a task that tracks connected account UUIDs.
+/// Returns the sender for communicating with it.
+fn spawn_connection_registry() -> mpsc::UnboundedSender<RegistryMsg> {
+    let (tx, mut rx) = mpsc::unbounded_channel::<RegistryMsg>();
+    tokio::spawn(async move {
+        let mut connected: HashSet<String> = HashSet::new();
+        while let Some(msg) = rx.recv().await {
+            match msg {
+                RegistryMsg::TryRegister { account_uuid, reply } => {
+                    let ok = connected.insert(account_uuid);
+                    let _ = reply.send(ok);
+                }
+                RegistryMsg::Unregister { account_uuid } => {
+                    connected.remove(&account_uuid);
+                }
+            }
+        }
+    });
+    tx
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Snapshot channel bridge
@@ -40,8 +76,6 @@ pub fn make_snapshot_bridge(
     let (std_tx, std_rx) = std_mpsc::sync_channel::<protocol::WorldSnapshot>(capacity);
     let (tok_tx, tok_rx) = mpsc::channel::<protocol::WorldSnapshot>(capacity);
 
-    // Bridge thread: blocks on the std sync receiver and pushes into the tokio
-    // sender.  Named threads aid debugging in profilers and panic traces.
     std::thread::Builder::new()
         .name("snapshot-bridge".to_string())
         .spawn(move || {
@@ -49,12 +83,10 @@ pub fn make_snapshot_bridge(
                 match std_rx.recv() {
                     Ok(snapshot) => {
                         if tok_tx.blocking_send(snapshot).is_err() {
-                            // Connection task has gone away.
                             break;
                         }
                     }
                     Err(_disconnected) => {
-                        // Zone dropped the SyncSender → this connection is done.
                         break;
                     }
                 }
@@ -80,6 +112,7 @@ pub async fn run_coordinator(
 ) {
     let mut zone_telemetry: HashMap<ZoneId, common::ZoneSnapshot> = HashMap::new();
     let mut zone_tick_counts: HashMap<ZoneId, (u64, std::time::Instant)> = HashMap::new();
+    let mut zone_entity_snapshots: HashMap<ZoneId, ZoneEntitySnapshot> = HashMap::new();
     let poll_interval = tokio::time::Duration::from_millis(5);
 
     loop {
@@ -132,14 +165,20 @@ pub async fn run_coordinator(
                             uptime_secs: start_time.elapsed().as_secs(),
                             connected_players,
                             zones: zone_telemetry.values().cloned().collect(),
+                            entity_snapshots: zone_entity_snapshots.values().cloned().collect(),
                         };
                         let _ = admin_tx.send(snap);
+                    }
+
+                    ZoneEvent::EntitySnapshot(es) => {
+                        zone_entity_snapshots.insert(es.zone_id, es);
                     }
 
                     ZoneEvent::ZoneTransfer {
                         entity_id,
                         destination,
                         position,
+                        label,
                     } => {
                         if let Some(inbox) = zone_inboxes.get(&destination) {
                             let (snap_tx, _snap_rx) = make_snapshot_bridge(32);
@@ -147,6 +186,7 @@ pub async fn run_coordinator(
                                 entity_id,
                                 position,
                                 snapshot_tx: snap_tx,
+                                label,
                             };
                             if inbox.send(cmd).is_err() {
                                 warn!(
@@ -182,14 +222,23 @@ pub async fn run_coordinator(
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Accept TCP connections and spawn a `run_connection` task for each one.
+///
+/// Each connection gets a unique, monotonically increasing [`EntityId`].
+/// After the connection task validates the JWT, a post-handshake wiring task:
+/// 1. Checks the connection registry for duplicate logins (sends auth result).
+/// 2. Waits for the connection task to select a character (receives EnterZoneRequest).
+/// 3. Sends `PlayerEnter` to the correct zone inbox and delivers the snapshot
+///    channel to the connection task via a oneshot.
 pub async fn run_tcp_listener(
     listener: tokio::net::TcpListener,
     router: gateway::ClientRouter,
     udp_tx: mpsc::Sender<UdpPacket>,
     zone_inboxes: HashMap<ZoneId, std_mpsc::SyncSender<ZoneCommand>>,
+    auth: GatewayAuth,
+    character_store: std::sync::Arc<dyn gateway::character_store::CharacterStore>,
 ) {
-    let default_zone_id = ZoneId::new(1);
-    let default_entity_id = EntityId::new(1);
+    let mut next_entity_id: u64 = 1;
+    let registry_tx = spawn_connection_registry();
 
     loop {
         let (stream, peer_addr) = match listener.accept().await {
@@ -202,32 +251,104 @@ pub async fn run_tcp_listener(
 
         info!(addr = %peer_addr, "new TCP connection");
 
-        let (snap_tx, snap_rx) = make_snapshot_bridge(32);
+        let entity_id = EntityId::new(next_entity_id);
+        next_entity_id += 1;
 
-        if let Some(inbox) = zone_inboxes.get(&default_zone_id) {
-            let cmd = ZoneCommand::PlayerEnter {
-                entity_id: default_entity_id,
-                position: Vec3::ZERO,
-                snapshot_tx: snap_tx,
-            };
-            if inbox.send(cmd).is_err() {
-                warn!(addr = %peer_addr, "zone 1 inbox closed; rejecting connection");
-                continue;
-            }
-        } else {
-            warn!(addr = %peer_addr, "no zone 1 found; cannot register player");
-            continue;
-        }
+        let (validated_tx, validated_rx) = oneshot::channel::<Option<String>>();
+        let (auth_result_tx, auth_result_rx) =
+            oneshot::channel::<Result<(), protocol::RejectReason>>();
+        let (enter_zone_tx, mut enter_zone_rx) = mpsc::channel::<EnterZoneRequest>(1);
+        let (snap_source_tx, snap_source_rx) =
+            oneshot::channel::<Result<mpsc::Receiver<protocol::WorldSnapshot>, protocol::RejectReason>>();
 
         let (tcp_read, tcp_write) = stream.into_split();
         let config = ConnectionConfig {
             peer_addr,
             udp_tx: udp_tx.clone(),
             router: router.clone(),
-            snapshot_rx: snap_rx,
+            auth: auth.clone(),
+            entity_id,
+            character_store: character_store.clone(),
+            validated_tx,
+            auth_result_rx,
+            enter_zone_tx,
+            snapshot_rx_source: snap_source_rx,
         };
 
-        tokio::spawn(gateway::run_connection(tcp_read, tcp_write, config));
+        let conn_handle = tokio::spawn(gateway::run_connection(tcp_read, tcp_write, config));
+
+        // Post-handshake wiring task. Three phases:
+        // 1. JWT validation + duplicate login check → auth_result_tx
+        // 2. Wait for character selection → enter_zone_rx
+        // 3. Wire zone snapshot channel → snap_source_tx
+        let zone_inboxes = zone_inboxes.clone();
+        let registry = registry_tx.clone();
+        tokio::spawn(async move {
+            // Phase 1: Wait for JWT validation result.
+            let account_uuid = match tokio::time::timeout(Duration::from_secs(10), validated_rx).await {
+                Ok(Ok(Some(uuid))) => uuid,
+                _ => {
+                    drop(snap_source_tx);
+                    return;
+                }
+            };
+
+            // Check if this account is already connected.
+            let (reply_tx, reply_rx) = oneshot::channel();
+            if registry.send(RegistryMsg::TryRegister {
+                account_uuid: account_uuid.clone(),
+                reply: reply_tx,
+            }).is_err() {
+                drop(snap_source_tx);
+                return;
+            }
+            match reply_rx.await {
+                Ok(true) => {
+                    // Registration succeeded — tell connection task to proceed to character selection.
+                    let _ = auth_result_tx.send(Ok(()));
+                }
+                _ => {
+                    // Account already connected — reject.
+                    warn!(account = %account_uuid, "duplicate login rejected");
+                    let _ = auth_result_tx.send(Err(protocol::RejectReason::AlreadyConnected));
+                    drop(snap_source_tx);
+                    return;
+                }
+            }
+
+            // Phase 2: Wait for character selection (EnterZoneRequest).
+            let enter_req = match tokio::time::timeout(Duration::from_secs(60), enter_zone_rx.recv()).await {
+                Ok(Some(req)) => req,
+                _ => {
+                    // Character selection timed out or connection dropped.
+                    drop(snap_source_tx);
+                    let _ = registry.send(RegistryMsg::Unregister { account_uuid });
+                    return;
+                }
+            };
+
+            // Phase 3: Wire up the zone snapshot channel.
+            let (snap_tx, snap_rx) = make_snapshot_bridge(32);
+            let cmd = ZoneCommand::PlayerEnter {
+                entity_id,
+                position: enter_req.position,
+                snapshot_tx: snap_tx,
+                label: enter_req.label,
+            };
+            if let Some(inbox) = zone_inboxes.get(&enter_req.zone_id) {
+                let _ = inbox.send(cmd);
+            } else {
+                warn!(zone = ?enter_req.zone_id, "player selected unknown zone");
+                let _ = snap_source_tx.send(Err(protocol::RejectReason::InvalidToken));
+                let _ = registry.send(RegistryMsg::Unregister { account_uuid });
+                return;
+            }
+            let _ = snap_source_tx.send(Ok(snap_rx));
+
+            // Wait for connection to end, then unregister.
+            let _ = conn_handle.await;
+            let _ = registry.send(RegistryMsg::Unregister { account_uuid });
+        });
     }
 }
 
@@ -267,9 +388,6 @@ pub async fn run_immediate_router(
 
 /// Spawn all zone threads defined in `world_config` and return the per-zone
 /// inbox senders and a single aggregated event receiver.
-///
-/// The `zone_event_tx` original sender is dropped before returning so the
-/// channel closes when all zone threads exit.
 pub fn spawn_zone_threads(
     world_config: &game_data::WorldConfig,
 ) -> anyhow::Result<(
@@ -282,7 +400,13 @@ pub fn spawn_zone_threads(
     for zone_config in &world_config.zones {
         let zone_id = ZoneId::new(zone_config.id);
         let (inbox_tx, inbox_rx) = std_mpsc::sync_channel::<ZoneCommand>(256);
-        let zone = Zone::new(zone_id, &zone_config.name);
+        let zone = world::Zone::with_config(
+            zone_id,
+            &zone_config.name,
+            zone_config.aoi_radius,
+            zone_config.width,
+            zone_config.height,
+        );
         let outbox_tx = zone_event_tx.clone();
 
         std::thread::Builder::new()

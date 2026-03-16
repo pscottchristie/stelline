@@ -1,18 +1,23 @@
 //! Manual test client for Stelline game server.
 //!
 //! Usage:
-//!   cargo run -p test-client                      # connect, handshake, move in a loop
-//!   cargo run -p test-client -- --token mytoken   # custom token
-//!   cargo run -p test-client -- --host 1.2.3.4    # remote server
+//!   cargo run -p test-client                                    # dev mode (JWT_SKIP_VALIDATION)
+//!   cargo run -p test-client -- --token mytoken                 # custom token (dev mode)
+//!   cargo run -p test-client -- --login alice hunter2           # login via login-server
+//!   cargo run -p test-client -- --login alice hunter2 --auth-host 10.0.0.5
+//!   cargo run -p test-client -- --host 1.2.3.4                  # remote game server
+//!   cargo run -p test-client -- --character Arthas              # select or create character by name
 //!
 //! What it does:
-//!   1. Connects TCP to the game server
-//!   2. Sends a Handshake
-//!   3. Prints HandshakeAccepted (entity id, zone)
-//!   4. Sends a Ping every 2 seconds and prints the Pong RTT
-//!   5. Sends MoveInput (walking north) every 50ms
-//!   6. Binds a UDP socket and listens for WorldSnapshot packets
-//!   7. Prints a summary of each snapshot received (tick, entity count)
+//!   1. Optionally calls login-server POST /login to get a JWT
+//!   2. Connects TCP to the game server
+//!   3. Sends a Handshake with the token
+//!   4. Lists characters; if --character is given, selects by name (or creates it)
+//!   5. Prints HandshakeAccepted (entity id, zone)
+//!   6. Sends a Ping every 2 seconds and prints the Pong RTT
+//!   7. Sends MoveInput (walking north) every 50ms
+//!   8. Binds a UDP socket and listens for WorldSnapshot packets
+//!   9. Prints a summary of each snapshot received (tick, entity count)
 
 use std::net::SocketAddr;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -20,9 +25,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use common::Vec2;
 use gateway::{read_tcp_message, write_tcp_message};
+use common::{Class, Race};
 use protocol::{
-    decode_server, encode_client, ClientMessage, Handshake, MoveInput, Ping,
-    ServerMessage, HEADER_SIZE,
+    decode_server, encode_client, ClientMessage, CharacterListRequest, CreateCharacter,
+    Handshake, MoveInput, Ping, SelectCharacter, ServerMessage, HEADER_SIZE,
 };
 use tokio::io::BufReader;
 use tokio::net::{TcpStream, UdpSocket};
@@ -40,18 +46,72 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    // ── Parse simple CLI args ─────────────────────────────────────────────────
+    // ── Parse CLI args ────────────────────────────────────────────────────────
     let args: Vec<String> = std::env::args().collect();
     let mut host = "127.0.0.1".to_string();
-    let mut token = "test-client-token".to_string();
+    let mut token: Option<String> = None;
+    let mut login_username: Option<String> = None;
+    let mut login_password: Option<String> = None;
+    let mut auth_host = "127.0.0.1".to_string();
+    let mut character_name: Option<String> = None;
+
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
-            "--host" => { host = args.get(i + 1).cloned().unwrap_or(host); i += 2; }
-            "--token" => { token = args.get(i + 1).cloned().unwrap_or(token); i += 2; }
-            _ => { i += 1; }
+            "--host" => {
+                host = args.get(i + 1).cloned().unwrap_or(host);
+                i += 2;
+            }
+            "--token" => {
+                token = Some(args.get(i + 1).cloned().unwrap_or_default());
+                i += 2;
+            }
+            "--login" => {
+                login_username = args.get(i + 1).cloned();
+                login_password = args.get(i + 2).cloned();
+                i += 3;
+            }
+            "--auth-host" => {
+                auth_host = args.get(i + 1).cloned().unwrap_or(auth_host);
+                i += 2;
+            }
+            "--character" => {
+                character_name = args.get(i + 1).cloned();
+                i += 2;
+            }
+            _ => {
+                i += 1;
+            }
         }
     }
+
+    // ── Resolve token ─────────────────────────────────────────────────────────
+    let token = if let (Some(username), Some(password)) = (login_username, login_password) {
+        info!(username = %username, auth_host = %auth_host, "logging in via login-server");
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("http://{auth_host}:8080/login"))
+            .json(&serde_json::json!({"username": username, "password": password}))
+            .send()
+            .await
+            .context("failed to reach login-server")?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("login-server returned {status}: {body}");
+        }
+
+        let body: serde_json::Value = resp.json().await.context("failed to parse login response")?;
+        let t = body["token"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("no 'token' field in login response"))?
+            .to_string();
+        info!("login successful — got JWT");
+        t
+    } else {
+        token.unwrap_or_else(|| "test-client-token".to_string())
+    };
 
     let tcp_addr = format!("{host}:7878");
     let _udp_server_addr = format!("{host}:7879");
@@ -71,18 +131,89 @@ async fn main() -> Result<()> {
     let mut tcp_reader = BufReader::new(tcp_read);
 
     // ── UDP socket for receiving snapshots ────────────────────────────────────
-    // Bind on the same IP as the TCP local addr so the server can reach us.
-    let udp_bind = format!("{}:0", local_addr.ip());
+    let udp_bind = format!("{}:{}", local_addr.ip(), local_addr.port());
     let udp_socket = UdpSocket::bind(&udp_bind).await?;
     let udp_local = udp_socket.local_addr()?;
     info!(udp_port = udp_local.port(), "UDP recv socket bound");
 
-    // ── Handshake ─────────────────────────────────────────────────────────────
+    // ── Phase 1: Handshake ─────────────────────────────────────────────────────
     let mut seq: u32 = 0;
     let hs = ClientMessage::Handshake(Handshake { token: token.clone() });
     let (h, p) = encode_client(&hs, seq)?;
     write_tcp_message(&mut tcp_write, &h, &p).await?;
-    info!(token = %token, "→ Handshake sent");
+    info!("→ Handshake sent (waiting for auth...)");
+
+    // ── Phase 2: Character Selection ─────────────────────────────────────────
+    // After auth succeeds, the server enters character selection phase.
+    // Request character list first.
+    seq = seq.wrapping_add(1);
+    let list_req = ClientMessage::CharacterListRequest(CharacterListRequest {});
+    let (h, p) = encode_client(&list_req, seq)?;
+    write_tcp_message(&mut tcp_write, &h, &p).await?;
+    info!("→ CharacterListRequest sent");
+
+    let (rh, rp) = read_tcp_message(&mut tcp_reader).await?;
+    let reply = decode_server(&rh, &rp)?;
+    let character_id = match reply {
+        ServerMessage::CharacterList(ref cl) => {
+            info!(count = cl.characters.len(), "← CharacterList");
+            for c in &cl.characters {
+                info!(name = %c.name, id = %c.id, level = c.level, race = ?c.race, class = ?c.class, "  character");
+            }
+
+            // Determine which character to select.
+            let desired_name = character_name.as_deref().unwrap_or("TestHero");
+
+            // Try to find an existing character by name.
+            if let Some(found) = cl.characters.iter().find(|c| c.name == desired_name) {
+                info!(name = %found.name, id = %found.id, "selecting existing character");
+                found.id.clone()
+            } else {
+                // Create a new character with the desired name.
+                info!(name = %desired_name, "character not found, creating...");
+                seq = seq.wrapping_add(1);
+                let create = ClientMessage::CreateCharacter(CreateCharacter {
+                    name: desired_name.to_string(),
+                    race: Race::Human,
+                    class: Class::Warrior,
+                });
+                let (h, p) = encode_client(&create, seq)?;
+                write_tcp_message(&mut tcp_write, &h, &p).await?;
+
+                let (rh, rp) = read_tcp_message(&mut tcp_reader).await?;
+                let reply = decode_server(&rh, &rp)?;
+                match reply {
+                    ServerMessage::CharacterCreated(ref cc) => {
+                        info!(name = %cc.character.name, id = %cc.character.id, "← CharacterCreated");
+                        cc.character.id.clone()
+                    }
+                    ServerMessage::CharacterCreateFailed(ref f) => {
+                        error!(reason = %f.reason, "← CharacterCreateFailed");
+                        return Ok(());
+                    }
+                    other => {
+                        error!(msg = ?other, "unexpected reply to CreateCharacter");
+                        return Ok(());
+                    }
+                }
+            }
+        }
+        ServerMessage::HandshakeRejected(ref rej) => {
+            error!(reason = ?rej.reason, "HandshakeRejected — check your token");
+            return Ok(());
+        }
+        other => {
+            error!(msg = ?other, "unexpected message during character selection");
+            return Ok(());
+        }
+    };
+
+    // Select the character.
+    seq = seq.wrapping_add(1);
+    let select = ClientMessage::SelectCharacter(SelectCharacter { character_id });
+    let (h, p) = encode_client(&select, seq)?;
+    write_tcp_message(&mut tcp_write, &h, &p).await?;
+    info!("→ SelectCharacter sent");
 
     let (rh, rp) = read_tcp_message(&mut tcp_reader).await?;
     let reply = decode_server(&rh, &rp)?;
@@ -91,15 +222,15 @@ async fn main() -> Result<()> {
             info!(
                 entity_id = accepted.entity_id.get(),
                 zone_id = accepted.zone_id.get(),
-                "✓ HandshakeAccepted"
+                "← HandshakeAccepted — entering world"
             );
         }
         ServerMessage::HandshakeRejected(ref rej) => {
-            error!(reason = ?rej.reason, "✗ HandshakeRejected — check your token");
+            error!(reason = ?rej.reason, "HandshakeRejected after character select");
             return Ok(());
         }
         other => {
-            error!(msg = ?other, "unexpected message during handshake");
+            error!(msg = ?other, "unexpected message after SelectCharacter");
             return Ok(());
         }
     }
@@ -110,8 +241,6 @@ async fn main() -> Result<()> {
     println!("  → sending MoveInput (north) every 50ms");
     println!("  → sending Ping every 2s");
     println!("  → listening for WorldSnapshot on UDP :{}", udp_local.port());
-    println!("  NOTE: Phase 1 server sends UDP to TCP peer addr port,");
-    println!("  not the UDP port above. Snapshots visible in server logs.");
     println!("═══════════════════════════════════════════════════");
     println!();
 
@@ -122,7 +251,6 @@ async fn main() -> Result<()> {
         loop {
             match udp_socket.recv_from(&mut buf).await {
                 Ok((n, from)) => {
-                    // Parse framed snapshot: 4-byte length + 11-byte header + payload
                     if n < FRAME_LEN_SIZE + HEADER_SIZE {
                         warn!(bytes = n, "UDP packet too short to parse");
                         continue;
@@ -199,7 +327,6 @@ async fn main() -> Result<()> {
                 let (h, p) = encode_client(&ping, seq)?;
                 write_tcp_message(&mut tcp_write, &h, &p).await?;
 
-                // Read the Pong reply.
                 match read_tcp_message(&mut tcp_reader).await {
                     Ok((rh, rp)) => match decode_server(&rh, &rp) {
                         Ok(ServerMessage::Pong(pong)) => {
@@ -208,7 +335,7 @@ async fn main() -> Result<()> {
                                 .unwrap_or_default()
                                 .as_millis() as u64;
                             let rtt_ms = now.saturating_sub(pong.client_timestamp);
-                            info!(rtt_ms, "← Pong (RTT)");
+                            info!(rtt_ms, "Pong (RTT)");
                         }
                         Ok(other) => warn!(msg = ?other, "expected Pong, got something else"),
                         Err(e) => warn!(error = %e, "failed to decode Pong"),
@@ -219,7 +346,6 @@ async fn main() -> Result<()> {
                     }
                 }
 
-                // Print snapshot stats every 2s.
                 let elapsed = last_stats.elapsed().as_secs_f32();
                 println!(
                     "  [stats] snapshots received last {elapsed:.1}s: {snapshot_count}  \
@@ -232,7 +358,6 @@ async fn main() -> Result<()> {
 
             Some(msg) = udp_rx.recv() => {
                 snapshot_count += 1;
-                // Only print every 10th snapshot to avoid flooding the terminal.
                 if snapshot_count % 10 == 1 {
                     println!("  {msg}");
                 }

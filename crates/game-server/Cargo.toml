@@ -25,6 +25,9 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
 serde = { workspace = true }
+redis = { workspace = true }
+sqlx = { workspace = true }
+dotenvy = { workspace = true }
 
 [dev-dependencies]
 tokio-test = { workspace = true }

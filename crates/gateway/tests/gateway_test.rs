@@ -5,30 +5,32 @@
 
 use bytes::Bytes;
 use common::{EntityFlags, EntityId, EntityKind, EntityState, Vec2, Vec3, ZoneId};
+use std::sync::Arc;
 use gateway::{
-    run_connection, run_udp_dispatch, ClientRouter, ConnectionConfig, GatewayError, GatewayHandle,
-    MessageClass, RoutedCommand, SessionState, UdpPacket,
-    {classify, read_tcp_message, write_tcp_message},
+    run_connection, run_udp_dispatch, ConnectionConfig, EnterZoneRequest, GatewayAuth,
+    GatewayHandle, MessageClass, RoutedCommand, SessionState, UdpPacket,
+    classify, read_tcp_message, write_tcp_message,
+    character_store::{CharacterStore, InMemoryCharacterStore},
 };
+use common::{Race, Class};
 use protocol::{
-    ClientMessage, Handshake, MoveInput, PacketHeader, Ping, ServerMessage, WorldSnapshot,
+    ClientMessage, Handshake, MoveInput, Ping, SelectCharacter, ServerMessage, WorldSnapshot,
 };
 use tokio::{
     io::BufReader,
     net::{tcp::OwnedWriteHalf, TcpListener, TcpStream, UdpSocket},
-    sync::mpsc,
+    sync::{mpsc, oneshot},
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Create a loopback TCP connection and return split halves for both ends.
 async fn tcp_duplex() -> (
-    OwnedWriteHalf,           // client writes here
-    BufReader<tokio::net::tcp::OwnedReadHalf>, // server reads here
-    OwnedWriteHalf,           // server writes here
-    BufReader<tokio::net::tcp::OwnedReadHalf>, // client reads here
+    OwnedWriteHalf,
+    BufReader<tokio::net::tcp::OwnedReadHalf>,
+    OwnedWriteHalf,
+    BufReader<tokio::net::tcp::OwnedReadHalf>,
 ) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -55,8 +57,27 @@ fn make_entity(seed: u64) -> EntityState {
     )
 }
 
+/// Auth config in dev mode (skip_validation=true): accepts any token.
+fn dev_auth() -> GatewayAuth {
+    GatewayAuth {
+        jwt_secret: b"integration-test-secret".to_vec(),
+        redis_client: redis::Client::open("redis://127.0.0.1:6379").unwrap(),
+        skip_validation: true,
+    }
+}
+
+/// Auth config in real mode (skip_validation=false): a garbage token will fail
+/// JWT decode without needing Redis.
+fn real_auth() -> GatewayAuth {
+    GatewayAuth {
+        jwt_secret: b"integration-test-secret".to_vec(),
+        redis_client: redis::Client::open("redis://127.0.0.1:6379").unwrap(),
+        skip_validation: false,
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
-// Framing: write_tcp_message + read_tcp_message
+// Framing
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[tokio::test]
@@ -73,9 +94,8 @@ async fn framing_header_and_payload_roundtrip() {
         .unwrap();
 
     let (header_in, payload_in) = read_tcp_message(&mut sr).await.unwrap();
-
-    assert_eq!(header_in, header_out, "header must survive the framing round-trip");
-    assert_eq!(payload_in, payload_out, "payload must survive the framing round-trip");
+    assert_eq!(header_in, header_out);
+    assert_eq!(payload_in, payload_out);
 
     let decoded = protocol::decode_client(&header_in, &payload_in).unwrap();
     assert_eq!(decoded, msg);
@@ -83,7 +103,6 @@ async fn framing_header_and_payload_roundtrip() {
 
 #[tokio::test]
 async fn framing_empty_payload_roundtrip() {
-    // Disconnect has zero payload bytes.
     let msg = ClientMessage::Disconnect;
     let (header_out, payload_out) = protocol::encode_client(&msg, 1).unwrap();
     assert!(payload_out.is_empty());
@@ -124,7 +143,6 @@ async fn framing_large_world_snapshot_100_entities() {
     if let ServerMessage::WorldSnapshot(s) = decoded {
         assert_eq!(s.tick, 12345);
         assert_eq!(s.entities.len(), 100);
-        // Verify a few entity fields survived.
         assert_eq!(s.entities[0].entity_id, EntityId::new(0));
         assert_eq!(s.entities[99].entity_id, EntityId::new(99));
     } else {
@@ -147,9 +165,6 @@ fn move_input_classifies_as_immediate() {
 
 #[test]
 fn handshake_stays_in_handshaking_state_until_accepted() {
-    // SessionState::Handshaking is the initial state — there is no auto-transition.
-    // This test validates the enum construction; the transition is tested via
-    // run_connection integration below.
     let state = SessionState::Handshaking;
     assert!(matches!(state, SessionState::Handshaking));
 }
@@ -207,11 +222,8 @@ fn move_input_routes_to_immediate_not_deferred() {
         })
         .unwrap();
 
-    assert!(immediate_rx.try_recv().is_ok(), "immediate_rx should have the command");
-    assert!(
-        deferred_rx.try_recv().is_err(),
-        "deferred_rx should be empty for MoveInput"
-    );
+    assert!(immediate_rx.try_recv().is_ok());
+    assert!(deferred_rx.try_recv().is_err());
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -224,7 +236,14 @@ async fn run_connection_accepts_valid_token() {
     let (udp_tx, _udp_rx) = mpsc::channel(8);
     let handle = GatewayHandle::new();
     let router = handle.router.clone();
-    let (_snap_tx, snap_rx) = mpsc::channel::<WorldSnapshot>(8);
+
+    let (validated_tx, validated_rx) = oneshot::channel::<Option<String>>();
+    let (auth_result_tx, auth_result_rx) = oneshot::channel::<Result<(), protocol::RejectReason>>();
+    let (enter_zone_tx, mut enter_zone_rx) = mpsc::channel::<EnterZoneRequest>(1);
+    let (snap_source_tx, snap_source_rx) = oneshot::channel::<Result<mpsc::Receiver<WorldSnapshot>, protocol::RejectReason>>();
+
+    let char_store = Arc::new(InMemoryCharacterStore::new());
+    let char_info = char_store.create("some-valid-jwt", "TestHero", Race::Human, Class::Warrior).await.unwrap();
 
     tokio::spawn(run_connection(
         server_r.into_inner(),
@@ -233,15 +252,57 @@ async fn run_connection_accepts_valid_token() {
             peer_addr: "127.0.0.1:10000".parse().unwrap(),
             udp_tx,
             router,
-            snapshot_rx: snap_rx,
+            auth: dev_auth(),
+            entity_id: EntityId::new(1),
+            character_store: char_store,
+            validated_tx,
+            auth_result_rx,
+            enter_zone_tx,
+            snapshot_rx_source: snap_source_rx,
         },
     ));
 
+    // Client sends Handshake.
     let hs = ClientMessage::Handshake(Handshake { token: "some-valid-jwt".into() });
     let (h, p) = protocol::encode_client(&hs, 1).unwrap();
     write_tcp_message(&mut client_w, &h, &p).await.unwrap();
 
-    let (rh, rp) = read_tcp_message(&mut client_r).await.unwrap();
+    // Simulate game-server: receive validation signal, send auth OK.
+    let valid = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        validated_rx,
+    )
+    .await
+    .expect("timed out waiting for validated_rx")
+    .unwrap();
+    assert!(valid.is_some());
+    auth_result_tx.send(Ok(())).unwrap();
+
+    // Client sends SelectCharacter.
+    let select = ClientMessage::SelectCharacter(SelectCharacter { character_id: char_info.id });
+    let (h, p) = protocol::encode_client(&select, 2).unwrap();
+    write_tcp_message(&mut client_w, &h, &p).await.unwrap();
+
+    // Simulate game-server: receive enter zone request, provide snapshot channel.
+    let _enter_req = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        enter_zone_rx.recv(),
+    )
+    .await
+    .expect("timed out waiting for enter_zone_rx")
+    .expect("enter_zone channel closed");
+
+    let (_snap_tx, snap_rx) = mpsc::channel::<WorldSnapshot>(8);
+    snap_source_tx.send(Ok(snap_rx)).unwrap();
+
+    // Client should receive HandshakeAccepted.
+    let (rh, rp) = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        read_tcp_message(&mut client_r),
+    )
+    .await
+    .expect("timed out waiting for HandshakeAccepted")
+    .unwrap();
     let reply = protocol::decode_server(&rh, &rp).unwrap();
 
     assert!(
@@ -257,7 +318,11 @@ async fn run_connection_rejects_empty_token() {
     let (udp_tx, _udp_rx) = mpsc::channel(8);
     let handle = GatewayHandle::new();
     let router = handle.router.clone();
-    let (_snap_tx, snap_rx) = mpsc::channel::<WorldSnapshot>(8);
+
+    let (validated_tx, _validated_rx) = oneshot::channel::<Option<String>>();
+    let (_auth_result_tx, auth_result_rx) = oneshot::channel::<Result<(), protocol::RejectReason>>();
+    let (enter_zone_tx, _enter_zone_rx) = mpsc::channel::<EnterZoneRequest>(1);
+    let (_snap_source_tx, snap_source_rx) = oneshot::channel::<Result<mpsc::Receiver<WorldSnapshot>, protocol::RejectReason>>();
 
     tokio::spawn(run_connection(
         server_r.into_inner(),
@@ -266,7 +331,13 @@ async fn run_connection_rejects_empty_token() {
             peer_addr: "127.0.0.1:10001".parse().unwrap(),
             udp_tx,
             router,
-            snapshot_rx: snap_rx,
+            auth: real_auth(),
+            entity_id: EntityId::new(1),
+            character_store: Arc::new(InMemoryCharacterStore::new()),
+            validated_tx,
+            auth_result_rx,
+            enter_zone_tx,
+            snapshot_rx_source: snap_source_rx,
         },
     ));
 
@@ -274,7 +345,13 @@ async fn run_connection_rejects_empty_token() {
     let (h, p) = protocol::encode_client(&hs, 1).unwrap();
     write_tcp_message(&mut client_w, &h, &p).await.unwrap();
 
-    let (rh, rp) = read_tcp_message(&mut client_r).await.unwrap();
+    let (rh, rp) = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        read_tcp_message(&mut client_r),
+    )
+    .await
+    .expect("timed out waiting for HandshakeRejected")
+    .unwrap();
     let reply = protocol::decode_server(&rh, &rp).unwrap();
 
     assert!(
@@ -296,7 +373,15 @@ async fn run_connection_routes_move_input_after_handshake() {
     let handle = GatewayHandle::new();
     let router = handle.router.clone();
     let GatewayHandle { mut immediate_rx, .. } = handle;
-    let (_snap_tx, snap_rx) = mpsc::channel::<WorldSnapshot>(8);
+
+    let (validated_tx, validated_rx) = oneshot::channel::<Option<String>>();
+    let (auth_result_tx, auth_result_rx) = oneshot::channel::<Result<(), protocol::RejectReason>>();
+    let (enter_zone_tx, mut enter_zone_rx) = mpsc::channel::<EnterZoneRequest>(1);
+    let (snap_source_tx, snap_source_rx) = oneshot::channel::<Result<mpsc::Receiver<WorldSnapshot>, protocol::RejectReason>>();
+
+    let assigned_entity = EntityId::new(77);
+    let char_store = Arc::new(InMemoryCharacterStore::new());
+    let char_info = char_store.create("tok", "Fighter", Race::Human, Class::Warrior).await.unwrap();
 
     tokio::spawn(run_connection(
         server_r.into_inner(),
@@ -305,15 +390,46 @@ async fn run_connection_routes_move_input_after_handshake() {
             peer_addr: "127.0.0.1:10002".parse().unwrap(),
             udp_tx,
             router,
-            snapshot_rx: snap_rx,
+            auth: dev_auth(),
+            entity_id: assigned_entity,
+            character_store: char_store,
+            validated_tx,
+            auth_result_rx,
+            enter_zone_tx,
+            snapshot_rx_source: snap_source_rx,
         },
     ));
 
-    // Handshake first.
+    // Send Handshake.
     let hs = ClientMessage::Handshake(Handshake { token: "tok".into() });
     let (h, p) = protocol::encode_client(&hs, 1).unwrap();
     write_tcp_message(&mut client_w, &h, &p).await.unwrap();
-    let (rh, rp) = read_tcp_message(&mut client_r).await.unwrap();
+
+    // Simulate game-server: auth OK.
+    let valid = tokio::time::timeout(std::time::Duration::from_secs(2), validated_rx)
+        .await.unwrap().unwrap();
+    assert!(valid.is_some());
+    auth_result_tx.send(Ok(())).unwrap();
+
+    // Client sends SelectCharacter.
+    let select = ClientMessage::SelectCharacter(SelectCharacter { character_id: char_info.id });
+    let (h, p) = protocol::encode_client(&select, 2).unwrap();
+    write_tcp_message(&mut client_w, &h, &p).await.unwrap();
+
+    // Simulate game-server: enter zone + snapshot channel.
+    let _enter_req = tokio::time::timeout(std::time::Duration::from_secs(2), enter_zone_rx.recv())
+        .await.unwrap().unwrap();
+    let (_snap_tx, snap_rx) = mpsc::channel::<WorldSnapshot>(8);
+    snap_source_tx.send(Ok(snap_rx)).unwrap();
+
+    // Read HandshakeAccepted.
+    let (rh, rp) = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        read_tcp_message(&mut client_r),
+    )
+    .await
+    .unwrap()
+    .unwrap();
     let reply = protocol::decode_server(&rh, &rp).unwrap();
     assert!(matches!(reply, ServerMessage::HandshakeAccepted(_)));
 
@@ -322,10 +438,10 @@ async fn run_connection_routes_move_input_after_handshake() {
         direction: Vec2::new(-1.0, 0.0),
         speed: 4.0,
     });
-    let (h, p) = protocol::encode_client(&mi, 2).unwrap();
+    let (h, p) = protocol::encode_client(&mi, 3).unwrap();
     write_tcp_message(&mut client_w, &h, &p).await.unwrap();
 
-    // The routed command should arrive on immediate_rx.
+    // Routed command should arrive on immediate_rx with the pre-assigned entity_id.
     let cmd = tokio::time::timeout(
         std::time::Duration::from_secs(2),
         immediate_rx.recv(),
@@ -334,17 +450,21 @@ async fn run_connection_routes_move_input_after_handshake() {
     .expect("timed out waiting for RoutedCommand")
     .expect("channel closed");
 
-    assert_eq!(cmd.entity_id, EntityId::new(1)); // Phase 1 stub assigns id=1
+    assert_eq!(cmd.entity_id, assigned_entity);
     assert!(matches!(cmd.message, ClientMessage::MoveInput(_)));
 }
 
 #[tokio::test]
-async fn run_connection_replies_pong_to_ping() {
+async fn run_connection_replies_pong_to_ping_before_handshake() {
     let (mut client_w, server_r, server_w, mut client_r) = tcp_duplex().await;
     let (udp_tx, _udp_rx) = mpsc::channel(8);
     let handle = GatewayHandle::new();
     let router = handle.router.clone();
-    let (_snap_tx, snap_rx) = mpsc::channel::<WorldSnapshot>(8);
+
+    let (validated_tx, _validated_rx) = oneshot::channel::<Option<String>>();
+    let (_auth_result_tx, auth_result_rx) = oneshot::channel::<Result<(), protocol::RejectReason>>();
+    let (enter_zone_tx, _enter_zone_rx) = mpsc::channel::<EnterZoneRequest>(1);
+    let (_snap_source_tx, snap_source_rx) = oneshot::channel::<Result<mpsc::Receiver<WorldSnapshot>, protocol::RejectReason>>();
 
     tokio::spawn(run_connection(
         server_r.into_inner(),
@@ -353,21 +473,32 @@ async fn run_connection_replies_pong_to_ping() {
             peer_addr: "127.0.0.1:10003".parse().unwrap(),
             udp_tx,
             router,
-            snapshot_rx: snap_rx,
+            auth: dev_auth(),
+            entity_id: EntityId::new(1),
+            character_store: Arc::new(InMemoryCharacterStore::new()),
+            validated_tx,
+            auth_result_rx,
+            enter_zone_tx,
+            snapshot_rx_source: snap_source_rx,
         },
     ));
 
-    // Send Ping without handshaking first (Ping is handled internally regardless of state).
+    // Send Ping before handshake — should still get a Pong.
     let ping = ClientMessage::Ping(Ping { client_timestamp: 999_888_777 });
     let (h, p) = protocol::encode_client(&ping, 1).unwrap();
     write_tcp_message(&mut client_w, &h, &p).await.unwrap();
 
-    let (rh, rp) = read_tcp_message(&mut client_r).await.unwrap();
+    let (rh, rp) = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        read_tcp_message(&mut client_r),
+    )
+    .await
+    .expect("timed out waiting for Pong")
+    .unwrap();
     let reply = protocol::decode_server(&rh, &rp).unwrap();
 
     if let ServerMessage::Pong(pong) = reply {
-        assert_eq!(pong.client_timestamp, 999_888_777, "echoed client timestamp");
-        // Server timestamp should be plausible (> 0).
+        assert_eq!(pong.client_timestamp, 999_888_777);
         assert!(pong.server_timestamp > 0);
     } else {
         panic!("expected Pong, got {:?}", reply);
@@ -375,16 +506,13 @@ async fn run_connection_replies_pong_to_ping() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// UdpDispatch integration test
+// UdpDispatch integration tests
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[tokio::test]
 async fn udp_dispatch_delivers_bytes_to_target_address() {
-    // Bind a receiver socket.
     let recv_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let recv_addr = recv_socket.local_addr().unwrap();
-
-    // Bind the dispatch (sender) socket.
     let dispatch_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
 
     let (tx, rx) = mpsc::channel::<UdpPacket>(16);
@@ -441,8 +569,6 @@ async fn udp_dispatch_multiple_packets_same_address() {
         received.push(buf[..n].to_vec());
     }
 
-    // All payloads must have arrived (order may vary on UDP but on loopback
-    // they will be in order).
     for (i, expected) in payloads.iter().enumerate() {
         assert_eq!(received[i], expected.as_ref(), "packet {} mismatch", i);
     }
@@ -454,8 +580,6 @@ async fn udp_dispatch_shuts_down_cleanly_when_channel_dropped() {
     let (tx, rx) = mpsc::channel::<UdpPacket>(8);
 
     let task = tokio::spawn(run_udp_dispatch(socket, rx));
-
-    // Drop the sender; the dispatch loop should exit.
     drop(tx);
 
     tokio::time::timeout(std::time::Duration::from_secs(2), task)

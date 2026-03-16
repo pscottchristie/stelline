@@ -14,6 +14,11 @@ anyhow = { workspace = true }
 bytes = { workspace = true }
 bincode = { workspace = true }
 serde = { workspace = true }
+jsonwebtoken = { workspace = true }
+redis = { workspace = true }
+async-trait = { workspace = true }
+uuid = { workspace = true }
+sqlx = { workspace = true }
 
 [dev-dependencies]
 tokio-test = { workspace = true }

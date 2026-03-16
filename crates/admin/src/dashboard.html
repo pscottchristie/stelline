@@ -163,6 +163,69 @@
   .dot.green { background: var(--green); }
   .dot.red   { background: var(--red); }
   .dot.yellow { background: var(--yellow); }
+
+  .accounts-status {
+    font-size: 12px;
+    color: var(--muted);
+    padding: 10px 16px 0;
+  }
+
+  .uuid { font-size: 12px; color: var(--muted); }
+
+  .btn {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    color: var(--accent);
+    padding: 4px 12px;
+    border-radius: 4px;
+    cursor: pointer;
+    font-family: var(--font);
+    font-size: 12px;
+  }
+  .btn:hover { border-color: var(--accent); }
+
+  /* World View */
+  #wv-controls {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    flex-wrap: wrap;
+  }
+  #wv-controls select, #wv-controls label {
+    font-family: var(--font);
+    font-size: 12px;
+    color: var(--text);
+    background: var(--surface);
+    border: 1px solid var(--border);
+    padding: 3px 8px;
+    border-radius: 4px;
+  }
+  #wv-controls input[type="radio"] { margin: 0 2px 0 8px; }
+  #wv-canvas-wrap {
+    position: relative;
+    width: 100%;
+    height: 500px;
+    background: #0a0e14;
+    cursor: grab;
+    overflow: hidden;
+  }
+  #wv-canvas-wrap:active { cursor: grabbing; }
+  #wv-canvas { display: block; width: 100%; height: 100%; }
+  #wv-legend {
+    display: flex;
+    gap: 16px;
+    padding: 8px 16px;
+    font-size: 11px;
+    color: var(--muted);
+    border-top: 1px solid var(--border);
+  }
+  .legend-item { display: flex; align-items: center; gap: 4px; }
+  .legend-dot {
+    display: inline-block;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+  }
 </style>
 </head>
 <body>
@@ -215,6 +278,49 @@
           </tr>
         </thead>
         <tbody id="zone-tbody">
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="panel" id="world-view-panel">
+    <div class="panel-title" style="display: flex; align-items: center; gap: 12px;">
+      World View
+      <div id="wv-controls">
+        <select id="wv-zone-select"><option value="">-- select zone --</option></select>
+        <label><input type="radio" name="wv-mode" value="god" checked>God</label>
+        <label><input type="radio" name="wv-mode" value="player">Player</label>
+        <select id="wv-player-select" style="display:none;"><option value="">-- select player --</option></select>
+      </div>
+    </div>
+    <div id="wv-canvas-wrap">
+      <canvas id="wv-canvas"></canvas>
+    </div>
+    <div id="wv-legend">
+      <span class="legend-item"><span class="legend-dot" style="background:#58a6ff;"></span>Player</span>
+      <span class="legend-item"><span class="legend-dot" style="background:#f85149;"></span>Mob</span>
+      <span class="legend-item"><span class="legend-dot" style="background:#3fb950;"></span>NPC</span>
+      <span class="legend-item"><span class="legend-dot" style="background:#8b949e;"></span>Object</span>
+    </div>
+  </div>
+
+  <div class="panel" id="accounts-panel">
+    <div class="panel-title" style="display: flex; align-items: center; gap: 12px;">
+      Accounts
+      <button class="btn" onclick="fetchAccounts()">Refresh</button>
+      <span id="accounts-status" class="accounts-status"></span>
+    </div>
+    <div class="panel-body" style="padding: 0;">
+      <table id="accounts-table">
+        <thead>
+          <tr>
+            <th>Username</th>
+            <th>Account ID</th>
+            <th>Created</th>
+          </tr>
+        </thead>
+        <tbody id="accounts-tbody">
+          <tr><td colspan="3" style="text-align: center; color: var(--muted); padding: 20px;">Loading...</td></tr>
         </tbody>
       </table>
     </div>
@@ -336,6 +442,416 @@
       ws.close();
     });
   }
+
+  // ── World View canvas ──────────────────────────────────────────────────
+  var wvCanvas     = document.getElementById('wv-canvas');
+  var wvCtx        = wvCanvas.getContext('2d');
+  var wvZoneSel    = document.getElementById('wv-zone-select');
+  var wvPlayerSel  = document.getElementById('wv-player-select');
+  var wvModeRadios = document.querySelectorAll('input[name="wv-mode"]');
+
+  // State
+  var wvEntitySnaps = {};   // zone_id -> ZoneEntitySnapshot
+  var wvTrails      = {};   // entity_id -> [{x, z, time}]
+  var wvCamera      = {x: 0, z: 0};
+  var wvScale       = 1.0;
+  var wvDragging    = false;
+  var wvDragStart   = {x: 0, y: 0};
+  var wvCameraDragStart = {x: 0, z: 0};
+
+  var TRAIL_MAX = 60;
+
+  function wvGetMode() {
+    for (var i = 0; i < wvModeRadios.length; i++) {
+      if (wvModeRadios[i].checked) return wvModeRadios[i].value;
+    }
+    return 'god';
+  }
+
+  function wvSelectedZoneId() {
+    return wvZoneSel.value ? Number(wvZoneSel.value) : null;
+  }
+
+  function wvSelectedPlayerId() {
+    return wvPlayerSel.value ? Number(wvPlayerSel.value) : null;
+  }
+
+  var entityColors = {
+    'Player':     '#58a6ff',
+    'Mob':        '#f85149',
+    'Npc':        '#3fb950',
+    'GameObject': '#8b949e'
+  };
+
+  function wvKindColor(kind) {
+    return entityColors[kind] || '#8b949e';
+  }
+
+  // Update zone selector dropdown
+  function wvUpdateZoneSelector(snap) {
+    var prev = wvZoneSel.value;
+    var zones = snap.entity_snapshots || [];
+    // Build set of zone ids
+    var ids = {};
+    for (var i = 0; i < zones.length; i++) ids[zones[i].zone_id] = zones[i];
+    // Also include zones from telemetry
+    for (var i = 0; i < snap.zones.length; i++) {
+      var zid = snap.zones[i].zone_id;
+      if (!ids[zid]) ids[zid] = null;
+    }
+
+    var keys = Object.keys(ids).sort(function(a,b){return a-b;});
+    wvZoneSel.innerHTML = '<option value="">-- select zone --</option>';
+    for (var i = 0; i < keys.length; i++) {
+      var zid = keys[i];
+      // Find name from telemetry
+      var name = 'Zone ' + zid;
+      for (var j = 0; j < snap.zones.length; j++) {
+        if (String(snap.zones[j].zone_id) === String(zid)) {
+          name = snap.zones[j].name;
+          break;
+        }
+      }
+      var opt = document.createElement('option');
+      opt.value = zid;
+      opt.textContent = name;
+      wvZoneSel.appendChild(opt);
+    }
+    // Restore previous selection
+    if (prev) wvZoneSel.value = prev;
+    // Auto-select first if nothing selected
+    if (!wvZoneSel.value && keys.length > 0) wvZoneSel.value = keys[0];
+  }
+
+  // Update player selector dropdown
+  function wvUpdatePlayerSelector() {
+    var zoneId = wvSelectedZoneId();
+    var es = zoneId !== null ? wvEntitySnaps[zoneId] : null;
+    var prev = wvPlayerSel.value;
+    wvPlayerSel.innerHTML = '<option value="">-- select player --</option>';
+    if (es) {
+      for (var i = 0; i < es.entities.length; i++) {
+        var e = es.entities[i];
+        if (e.kind === 'Player') {
+          var opt = document.createElement('option');
+          opt.value = e.entity_id;
+          opt.textContent = e.label || ('Entity ' + e.entity_id);
+          wvPlayerSel.appendChild(opt);
+        }
+      }
+    }
+    if (prev) wvPlayerSel.value = prev;
+  }
+
+  // Store entity snapshots and update trails
+  function wvProcessEntitySnapshots(snapshots) {
+    var now = Date.now();
+    for (var i = 0; i < snapshots.length; i++) {
+      var es = snapshots[i];
+      wvEntitySnaps[es.zone_id] = es;
+      // Update trails
+      for (var j = 0; j < es.entities.length; j++) {
+        var e = es.entities[j];
+        var key = es.zone_id + ':' + e.entity_id;
+        if (!wvTrails[key]) wvTrails[key] = [];
+        var trail = wvTrails[key];
+        trail.push({x: e.position.x, z: e.position.z, t: now});
+        if (trail.length > TRAIL_MAX) trail.shift();
+      }
+    }
+  }
+
+  // Mode toggle: show/hide player selector
+  for (var i = 0; i < wvModeRadios.length; i++) {
+    wvModeRadios[i].addEventListener('change', function() {
+      wvPlayerSel.style.display = wvGetMode() === 'player' ? '' : 'none';
+      wvUpdatePlayerSelector();
+    });
+  }
+  wvZoneSel.addEventListener('change', function() {
+    wvUpdatePlayerSelector();
+    // Reset camera to zone center
+    var zoneId = wvSelectedZoneId();
+    var es = zoneId !== null ? wvEntitySnaps[zoneId] : null;
+    if (es) {
+      wvCamera.x = es.width / 2;
+      wvCamera.z = es.height / 2;
+    }
+  });
+
+  // Pan: mouse drag
+  wvCanvas.addEventListener('mousedown', function(ev) {
+    wvDragging = true;
+    wvDragStart.x = ev.clientX;
+    wvDragStart.y = ev.clientY;
+    wvCameraDragStart.x = wvCamera.x;
+    wvCameraDragStart.z = wvCamera.z;
+  });
+  window.addEventListener('mousemove', function(ev) {
+    if (!wvDragging) return;
+    var dx = ev.clientX - wvDragStart.x;
+    var dy = ev.clientY - wvDragStart.y;
+    wvCamera.x = wvCameraDragStart.x - dx / wvScale;
+    wvCamera.z = wvCameraDragStart.z - dy / wvScale;
+  });
+  window.addEventListener('mouseup', function() { wvDragging = false; });
+
+  // Zoom: scroll wheel
+  wvCanvas.addEventListener('wheel', function(ev) {
+    ev.preventDefault();
+    var factor = ev.deltaY > 0 ? 0.9 : 1.1;
+    wvScale = Math.max(0.05, Math.min(20, wvScale * factor));
+  }, {passive: false});
+
+  // World→screen transform
+  function wvW2S(wx, wz) {
+    var cw = wvCanvas.width;
+    var ch = wvCanvas.height;
+    return {
+      x: (wx - wvCamera.x) * wvScale + cw / 2,
+      y: (wz - wvCamera.z) * wvScale + ch / 2
+    };
+  }
+
+  function wvRenderFrame() {
+    var cw = wvCanvas.parentElement.clientWidth;
+    var ch = wvCanvas.parentElement.clientHeight;
+    var dpr = window.devicePixelRatio || 1;
+    wvCanvas.width = cw * dpr;
+    wvCanvas.height = ch * dpr;
+    wvCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+    var ctx = wvCtx;
+    ctx.fillStyle = '#0a0e14';
+    ctx.fillRect(0, 0, cw, ch);
+
+    var zoneId = wvSelectedZoneId();
+    if (zoneId === null) {
+      ctx.fillStyle = '#8b949e';
+      ctx.font = '14px Courier New';
+      ctx.textAlign = 'center';
+      ctx.fillText('Select a zone', cw / 2, ch / 2);
+      requestAnimationFrame(wvRenderFrame);
+      return;
+    }
+
+    var es = wvEntitySnaps[zoneId];
+    if (!es) {
+      ctx.fillStyle = '#8b949e';
+      ctx.font = '14px Courier New';
+      ctx.textAlign = 'center';
+      ctx.fillText('Waiting for entity data...', cw / 2, ch / 2);
+      requestAnimationFrame(wvRenderFrame);
+      return;
+    }
+
+    var mode = wvGetMode();
+    var selectedPlayer = null;
+    if (mode === 'player') {
+      var pid = wvSelectedPlayerId();
+      if (pid !== null) {
+        for (var i = 0; i < es.entities.length; i++) {
+          if (es.entities[i].entity_id === pid) {
+            selectedPlayer = es.entities[i];
+            break;
+          }
+        }
+      }
+      if (selectedPlayer) {
+        wvCamera.x = selectedPlayer.position.x;
+        wvCamera.z = selectedPlayer.position.z;
+      }
+    }
+
+    // Draw grid
+    ctx.strokeStyle = '#1a2030';
+    ctx.lineWidth = 1;
+    var gridStep = 100;
+    // Compute visible world bounds
+    var worldLeft   = wvCamera.x - cw / 2 / wvScale;
+    var worldRight  = wvCamera.x + cw / 2 / wvScale;
+    var worldTop    = wvCamera.z - ch / 2 / wvScale;
+    var worldBottom = wvCamera.z + ch / 2 / wvScale;
+
+    var startX = Math.floor(worldLeft / gridStep) * gridStep;
+    var startZ = Math.floor(worldTop / gridStep) * gridStep;
+    ctx.beginPath();
+    for (var gx = startX; gx <= worldRight; gx += gridStep) {
+      var s = wvW2S(gx, 0);
+      ctx.moveTo(s.x, 0);
+      ctx.lineTo(s.x, ch);
+    }
+    for (var gz = startZ; gz <= worldBottom; gz += gridStep) {
+      var s = wvW2S(0, gz);
+      ctx.moveTo(0, s.y);
+      ctx.lineTo(cw, s.y);
+    }
+    ctx.stroke();
+
+    // Draw zone boundary
+    var tl = wvW2S(0, 0);
+    var br = wvW2S(es.width, es.height);
+    ctx.strokeStyle = '#30363d';
+    ctx.lineWidth = 2;
+    ctx.strokeRect(tl.x, tl.y, br.x - tl.x, br.y - tl.y);
+
+    // Origin marker
+    var origin = wvW2S(0, 0);
+    ctx.fillStyle = '#30363d';
+    ctx.font = '10px Courier New';
+    ctx.textAlign = 'left';
+    ctx.fillText('(0,0)', origin.x + 4, origin.y - 4);
+
+    // Filter entities for player mode
+    var ents = es.entities;
+    if (mode === 'player' && selectedPlayer) {
+      var aoiR = es.aoi_radius;
+      ents = [];
+      for (var i = 0; i < es.entities.length; i++) {
+        var e = es.entities[i];
+        var dx = e.position.x - selectedPlayer.position.x;
+        var dz = e.position.z - selectedPlayer.position.z;
+        if (Math.sqrt(dx*dx + dz*dz) <= aoiR) {
+          ents.push(e);
+        }
+      }
+    }
+
+    // Draw trails
+    var now = Date.now();
+    for (var i = 0; i < ents.length; i++) {
+      var e = ents[i];
+      var key = zoneId + ':' + e.entity_id;
+      var trail = wvTrails[key];
+      if (!trail || trail.length < 2) continue;
+      ctx.beginPath();
+      for (var j = 0; j < trail.length; j++) {
+        var s = wvW2S(trail[j].x, trail[j].z);
+        if (j === 0) ctx.moveTo(s.x, s.y);
+        else ctx.lineTo(s.x, s.y);
+      }
+      var alpha = 0.15 + 0.15 * (trail.length / TRAIL_MAX);
+      ctx.strokeStyle = wvKindColor(e.kind);
+      ctx.globalAlpha = alpha;
+      ctx.lineWidth = 1.5;
+      ctx.stroke();
+      ctx.globalAlpha = 1.0;
+    }
+
+    // Draw AOI circles for players
+    for (var i = 0; i < ents.length; i++) {
+      var e = ents[i];
+      if (e.kind !== 'Player') continue;
+      var s = wvW2S(e.position.x, e.position.z);
+      var r = es.aoi_radius * wvScale;
+      ctx.beginPath();
+      ctx.arc(s.x, s.y, r, 0, Math.PI * 2);
+      ctx.strokeStyle = wvKindColor(e.kind);
+      ctx.globalAlpha = (mode === 'player' && selectedPlayer && e.entity_id === selectedPlayer.entity_id) ? 0.3 : 0.1;
+      ctx.lineWidth = 1;
+      ctx.stroke();
+      ctx.globalAlpha = 1.0;
+    }
+
+    // Draw entities
+    for (var i = 0; i < ents.length; i++) {
+      var e = ents[i];
+      var s = wvW2S(e.position.x, e.position.z);
+      var color = wvKindColor(e.kind);
+      var dotR = e.kind === 'Player' ? 5 : 3;
+
+      ctx.beginPath();
+      ctx.arc(s.x, s.y, dotR, 0, Math.PI * 2);
+      ctx.fillStyle = color;
+      ctx.fill();
+
+      // Label
+      if (e.label) {
+        ctx.fillStyle = '#c9d1d9';
+        ctx.font = '10px Courier New';
+        ctx.textAlign = 'center';
+        ctx.fillText(e.label, s.x, s.y - dotR - 3);
+      }
+    }
+
+    // Info text
+    ctx.fillStyle = '#8b949e';
+    ctx.font = '10px Courier New';
+    ctx.textAlign = 'left';
+    ctx.fillText('Entities: ' + ents.length + '  Zoom: ' + wvScale.toFixed(2) + 'x', 8, ch - 8);
+    ctx.textAlign = 'right';
+    ctx.fillText('Camera: (' + wvCamera.x.toFixed(0) + ', ' + wvCamera.z.toFixed(0) + ')', cw - 8, ch - 8);
+
+    requestAnimationFrame(wvRenderFrame);
+  }
+
+  // Start render loop
+  requestAnimationFrame(wvRenderFrame);
+
+  // Hook into snapshot rendering to process entity data
+  var origRenderSnap = renderSnapshot;
+  renderSnapshot = function(snap) {
+    origRenderSnap(snap);
+    if (snap.entity_snapshots) {
+      wvProcessEntitySnapshots(snap.entity_snapshots);
+      // Don't rebuild dropdowns while the user has them open — destroying
+      // <option> nodes under an open <select> causes massive layout thrashing.
+      if (document.activeElement !== wvZoneSel) wvUpdateZoneSelector(snap);
+      if (document.activeElement !== wvPlayerSel) wvUpdatePlayerSelector();
+    }
+  };
+
+  // ── Accounts viewer ────────────────────────────────────────────────────
+  const accountsTbody  = document.getElementById('accounts-tbody');
+  const accountsStatus = document.getElementById('accounts-status');
+
+  window.fetchAccounts = function fetchAccounts() {
+    accountsStatus.textContent = 'Loading...';
+    fetch('/admin/api/accounts')
+      .then(function (resp) {
+        if (resp.status === 503) {
+          accountsTbody.innerHTML = '<tr><td colspan="3" style="text-align:center;color:var(--muted);padding:20px;">Database not configured (set DATABASE_URL)</td></tr>';
+          accountsStatus.textContent = '';
+          return null;
+        }
+        if (!resp.ok) throw new Error('HTTP ' + resp.status);
+        return resp.json();
+      })
+      .then(function (accounts) {
+        if (!accounts) return;
+        if (accounts.length === 0) {
+          accountsTbody.innerHTML = '<tr><td colspan="3" style="text-align:center;color:var(--muted);padding:20px;">No accounts registered</td></tr>';
+          accountsStatus.textContent = '';
+          return;
+        }
+        accountsTbody.innerHTML = '';
+        accounts.forEach(function (a) {
+          var tr = document.createElement('tr');
+          var created = new Date(a.created_at);
+          var timeStr = created.toLocaleDateString() + ' ' + created.toLocaleTimeString();
+          tr.innerHTML =
+            '<td class="zone-name">' + escHtml(a.username) + '</td>' +
+            '<td class="uuid">' + escHtml(a.id) + '</td>' +
+            '<td>' + timeStr + '</td>';
+          accountsTbody.appendChild(tr);
+        });
+        accountsStatus.textContent = accounts.length + ' account' + (accounts.length !== 1 ? 's' : '');
+      })
+      .catch(function (err) {
+        accountsStatus.textContent = 'Error: ' + err.message;
+      });
+  };
+
+  // Fetch accounts on first snapshot (dashboard becomes visible)
+  var accountsFetched = false;
+  var origRender = renderSnapshot;
+  renderSnapshot = function (snap) {
+    origRender(snap);
+    if (!accountsFetched) {
+      accountsFetched = true;
+      window.fetchAccounts();
+    }
+  };
 
   connect();
 }());

@@ -6,10 +6,14 @@
 
 use std::collections::HashMap;
 use std::sync::mpsc as std_mpsc;
+use std::sync::Arc;
 use std::time::Duration;
 
-use common::{AdminSnapshot, ZoneId};
-use gateway::{GatewayHandle, UdpPacket};
+use common::{AdminSnapshot, Class, Race, ZoneId};
+use gateway::{
+    character_store::{CharacterStore, InMemoryCharacterStore},
+    GatewayAuth, GatewayHandle, UdpPacket,
+};
 use tokio::sync::{mpsc, watch};
 
 use game_server::{make_snapshot_bridge, run_coordinator, run_tcp_listener, spawn_zone_threads};
@@ -17,6 +21,22 @@ use game_server::{make_snapshot_bridge, run_coordinator, run_tcp_listener, spawn
 // ─────────────────────────────────────────────────────────────────────────────
 // Helpers
 // ─────────────────────────────────────────────────────────────────────────────
+
+fn dev_auth() -> GatewayAuth {
+    GatewayAuth {
+        jwt_secret: b"e2e-test-secret".to_vec(),
+        redis_client: redis::Client::open("redis://127.0.0.1:6379").unwrap(),
+        skip_validation: true,
+    }
+}
+
+fn real_auth() -> GatewayAuth {
+    GatewayAuth {
+        jwt_secret: b"e2e-test-secret".to_vec(),
+        redis_client: redis::Client::open("redis://127.0.0.1:6379").unwrap(),
+        skip_validation: false,
+    }
+}
 
 /// Write a length-prefixed TCP frame to the stream.
 async fn write_frame(
@@ -53,15 +73,49 @@ async fn read_server_msg(stream: &mut tokio::net::TcpStream) -> protocol::Server
     protocol::decode_server(&header, payload).unwrap()
 }
 
-/// Connect to a TCP server and perform the handshake, asserting `HandshakeAccepted`.
-async fn do_handshake(addr: std::net::SocketAddr) -> tokio::net::TcpStream {
+/// Connect to a TCP server and perform the full handshake + character select flow,
+/// asserting `HandshakeAccepted`.
+async fn do_handshake(
+    addr: std::net::SocketAddr,
+    char_store: &Arc<dyn CharacterStore>,
+) -> tokio::net::TcpStream {
+    do_handshake_with_token(addr, "test-token", char_store).await
+}
+
+/// Connect with a specific token. Creates a character if needed and selects it.
+async fn do_handshake_with_token(
+    addr: std::net::SocketAddr,
+    token: &str,
+    char_store: &Arc<dyn CharacterStore>,
+) -> tokio::net::TcpStream {
     let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+
+    // Phase 1: Handshake.
     let hs = protocol::ClientMessage::Handshake(protocol::Handshake {
-        token: "test-token".to_string(),
+        token: token.to_string(),
     });
     write_frame(&mut stream, &hs, 1).await;
 
-    let reply = tokio::time::timeout(Duration::from_millis(500), read_server_msg(&mut stream))
+    // Phase 2: Create a character and select it.
+    // Use the token as account_id (dev mode uses token string as subject).
+    // Generate a unique name from a hash of the token to avoid collisions.
+    let hash: u32 = token.bytes().fold(0u32, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u32));
+    let char_name = format!("H{:08x}", hash);
+    let char_info = match char_store.create(token, &char_name, Race::Human, Class::Warrior).await {
+        Ok(info) => info,
+        Err(_) => {
+            // Character may already exist from a previous test; list and use first one.
+            let list = char_store.list(token).await.unwrap();
+            list.into_iter().next().expect("no characters found")
+        }
+    };
+
+    let select = protocol::ClientMessage::SelectCharacter(protocol::SelectCharacter {
+        character_id: char_info.id,
+    });
+    write_frame(&mut stream, &select, 2).await;
+
+    let reply = tokio::time::timeout(Duration::from_secs(2), read_server_msg(&mut stream))
         .await
         .expect("timed out waiting for handshake reply");
 
@@ -74,10 +128,13 @@ async fn do_handshake(addr: std::net::SocketAddr) -> tokio::net::TcpStream {
 }
 
 /// Spin up a minimal server: one zone, TCP listener, UDP socket.
-/// Returns (tcp_addr, zone_inboxes).
-async fn start_minimal_server() -> (
+/// Returns (tcp_addr, zone_inboxes, character_store).
+async fn start_minimal_server_with_auth(
+    auth: GatewayAuth,
+) -> (
     std::net::SocketAddr,
     HashMap<ZoneId, std_mpsc::SyncSender<world::ZoneCommand>>,
+    Arc<dyn CharacterStore>,
 ) {
     let world_config = game_data::WorldConfig {
         zones: vec![game_data::ZoneConfig {
@@ -98,6 +155,8 @@ async fn start_minimal_server() -> (
     let (udp_tx, udp_rx) = mpsc::channel::<UdpPacket>(64);
     tokio::spawn(gateway::run_udp_dispatch(udp_socket, udp_rx));
 
+    let character_store: Arc<dyn CharacterStore> = Arc::new(InMemoryCharacterStore::new());
+
     let tcp_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let tcp_addr = tcp_listener.local_addr().unwrap();
 
@@ -106,9 +165,19 @@ async fn start_minimal_server() -> (
         router,
         udp_tx,
         zone_inboxes.clone(),
+        auth,
+        character_store.clone(),
     ));
 
-    (tcp_addr, zone_inboxes)
+    (tcp_addr, zone_inboxes, character_store)
+}
+
+async fn start_minimal_server() -> (
+    std::net::SocketAddr,
+    HashMap<ZoneId, std_mpsc::SyncSender<world::ZoneCommand>>,
+    Arc<dyn CharacterStore>,
+) {
+    start_minimal_server_with_auth(dev_auth()).await
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -117,12 +186,11 @@ async fn start_minimal_server() -> (
 
 #[tokio::test]
 async fn test_connect_handshake_accepted() {
-    let (tcp_addr, _) = start_minimal_server().await;
+    let (tcp_addr, _, char_store) = start_minimal_server().await;
 
-    // Give the server a moment to start listening.
     tokio::time::sleep(Duration::from_millis(20)).await;
 
-    let _ = tokio::time::timeout(Duration::from_secs(2), do_handshake(tcp_addr))
+    let _ = tokio::time::timeout(Duration::from_secs(2), do_handshake(tcp_addr, &char_store))
         .await
         .expect("handshake timed out");
 }
@@ -136,25 +204,21 @@ async fn test_admin_dashboard_reachable() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let (admin_tx, admin_rx) = watch::channel(AdminSnapshot::default());
-    // Keep admin_tx alive for the duration of the test.
     let _admin_tx = admin_tx;
 
-    // Bind on a random port.
     let admin_port = {
         let tmp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = tmp.local_addr().unwrap().port();
-        drop(tmp); // release so start_admin_server can bind it
+        drop(tmp);
         port
     };
 
-    admin::start_admin_server(admin_port, admin_rx)
+    admin::start_admin_server(admin_port, admin_rx, None)
         .await
         .expect("admin server failed to start");
 
-    // Small delay so axum is ready to accept.
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    // Send a raw HTTP/1.1 GET request.
     let mut stream =
         tokio::time::timeout(
             Duration::from_secs(2),
@@ -179,14 +243,12 @@ async fn test_admin_dashboard_reachable() {
     .expect("read timed out")
     .expect("read failed");
 
-    // Assert HTTP 200.
     assert!(
         response.starts_with("HTTP/1.1 200"),
         "expected HTTP 200, got: {}",
         &response[..response.len().min(200)]
     );
 
-    // Assert body contains "stelline".
     let body_lower = response.to_lowercase();
     assert!(
         body_lower.contains("stelline"),
@@ -222,9 +284,6 @@ async fn test_zone_telemetry_reaches_admin_watch() {
         start_time,
     ));
 
-    // Wait for the coordinator to process at least one telemetry event and
-    // update the admin snapshot.  The zone ticks at 20 Hz so one tick (50 ms)
-    // should arrive well within 500 ms.
     let updated = tokio::time::timeout(Duration::from_millis(500), async {
         loop {
             admin_rx.changed().await.unwrap();
@@ -237,18 +296,10 @@ async fn test_zone_telemetry_reaches_admin_watch() {
     .await
     .expect("timed out waiting for telemetry to reach admin snapshot");
 
-    assert!(
-        !updated.zones.is_empty(),
-        "admin snapshot should have at least one zone after telemetry"
-    );
+    assert!(!updated.zones.is_empty());
 
     let zone_snap = &updated.zones[0];
-    // The zone has been ticking — at least tick 1 should have been processed.
-    assert_eq!(
-        zone_snap.zone_id,
-        ZoneId::new(1),
-        "zone_id should match the spawned zone"
-    );
+    assert_eq!(zone_snap.zone_id, ZoneId::new(1));
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -257,18 +308,19 @@ async fn test_zone_telemetry_reaches_admin_watch() {
 
 #[tokio::test]
 async fn test_multiple_clients_connect_concurrently() {
-    let (tcp_addr, _) = start_minimal_server().await;
-
-    // Small delay for server startup.
+    let (tcp_addr, _, char_store) = start_minimal_server().await;
     tokio::time::sleep(Duration::from_millis(30)).await;
 
-    // Connect 3 clients simultaneously and have each do a handshake.
     let tasks: Vec<_> = (0..3)
-        .map(|_| {
-            tokio::spawn(tokio::time::timeout(
-                Duration::from_secs(2),
-                do_handshake(tcp_addr),
-            ))
+        .map(|i| {
+            let token = format!("test-user-{i}");
+            let cs = char_store.clone();
+            tokio::spawn(async move {
+                tokio::time::timeout(
+                    Duration::from_secs(2),
+                    do_handshake_with_token(tcp_addr, &token, &cs),
+                ).await
+            })
         })
         .collect();
 
@@ -303,28 +355,29 @@ async fn test_snapshot_bridge_delivers_snapshots() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Test 6: Handshake rejected for empty token
+// Test 6: Handshake rejected for invalid token (real validation mode)
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[tokio::test]
-async fn test_handshake_rejected_empty_token() {
-    let (tcp_addr, _) = start_minimal_server().await;
+async fn test_handshake_rejected_invalid_token() {
+    // Use real_auth (skip_validation=false) so a garbage token fails JWT decode.
+    let (tcp_addr, _, _char_store) = start_minimal_server_with_auth(real_auth()).await;
     tokio::time::sleep(Duration::from_millis(20)).await;
 
     let mut stream = tokio::net::TcpStream::connect(tcp_addr).await.unwrap();
 
     let hs = protocol::ClientMessage::Handshake(protocol::Handshake {
-        token: String::new(), // empty token → should be rejected
+        token: "not-a-valid-jwt".to_string(),
     });
     write_frame(&mut stream, &hs, 1).await;
 
-    let reply = tokio::time::timeout(Duration::from_millis(500), read_server_msg(&mut stream))
+    let reply = tokio::time::timeout(Duration::from_secs(2), read_server_msg(&mut stream))
         .await
         .expect("timed out waiting for handshake reply");
 
     assert!(
         matches!(reply, protocol::ServerMessage::HandshakeRejected(_)),
-        "expected HandshakeRejected for empty token, got {:?}",
+        "expected HandshakeRejected for invalid token, got {:?}",
         reply
     );
 }

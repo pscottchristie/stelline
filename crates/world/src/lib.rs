@@ -48,6 +48,11 @@ pub struct Player {
     pub entity_id: EntityId,
 }
 
+/// Human-readable label for an entity (e.g. username for players).
+/// Used by the admin world view canvas to display names next to entity dots.
+#[derive(Debug, Clone)]
+pub struct Label(pub String);
+
 // ─────────────────────────────────────────────────────────────────────────────
 // ZoneCommand — messages sent INTO a zone
 // ─────────────────────────────────────────────────────────────────────────────
@@ -65,6 +70,8 @@ pub enum ZoneCommand {
         entity_id: EntityId,
         position: Vec3,
         snapshot_tx: SyncSender<WorldSnapshot>,
+        /// Human-readable label (username) for admin dashboard display.
+        label: String,
     },
     /// A player character is leaving this zone (disconnecting or transferring).
     ///
@@ -95,9 +102,13 @@ pub enum ZoneEvent {
         entity_id: EntityId,
         destination: ZoneId,
         position: Vec3,
+        label: String,
     },
     /// Per-tick telemetry for the admin dashboard.
     TelemetryUpdate(ZoneTelemetry),
+    /// Per-zone entity snapshot for the admin world view canvas.
+    /// Emitted at a reduced rate (every 4th tick = 5 Hz).
+    EntitySnapshot(common::ZoneEntitySnapshot),
 }
 
 /// Telemetry snapshot emitted by a zone once per tick.
@@ -280,6 +291,10 @@ pub struct Zone {
     /// player's snapshot. Entities beyond this are implicitly despawned on
     /// the client side.
     aoi_radius: f32,
+    /// Zone playable area width in world units (for admin canvas scaling).
+    width: f32,
+    /// Zone playable area height in world units (for admin canvas scaling).
+    height: f32,
 }
 
 impl Zone {
@@ -294,6 +309,30 @@ impl Zone {
             connections: HashMap::new(),
             tick: 0,
             aoi_radius: DEFAULT_AOI_RADIUS,
+            width: 1000.0,
+            height: 1000.0,
+        }
+    }
+
+    /// Create a new, empty zone with explicit dimensions and AOI radius.
+    pub fn with_config(
+        id: ZoneId,
+        name: impl Into<String>,
+        aoi_radius: f32,
+        width: f32,
+        height: f32,
+    ) -> Self {
+        Self {
+            id,
+            name: name.into(),
+            world: hecs::World::new(),
+            spatial_index: SpatialIndex::new(50.0),
+            entity_map: HashMap::new(),
+            connections: HashMap::new(),
+            tick: 0,
+            aoi_radius,
+            width,
+            height,
         }
     }
 
@@ -317,8 +356,9 @@ impl Zone {
                 entity_id,
                 position,
                 snapshot_tx,
+                label,
             } => {
-                self.admit_player(entity_id, position, snapshot_tx);
+                self.admit_player(entity_id, position, snapshot_tx, label);
             }
             ZoneCommand::PlayerLeave { entity_id } => {
                 self.remove_entity(entity_id);
@@ -340,6 +380,7 @@ impl Zone {
         entity_id: EntityId,
         position: Vec3,
         snapshot_tx: SyncSender<WorldSnapshot>,
+        label: String,
     ) {
         // Default health for Phase 1 players.
         let health = Health {
@@ -352,6 +393,7 @@ impl Zone {
             Velocity(Vec2::ZERO),
             health,
             Player { entity_id },
+            Label(label),
         ));
 
         self.entity_map.insert(entity_id, hecs_entity);
@@ -418,7 +460,12 @@ impl Zone {
         // Stage 5: send snapshots to all connected players
         self.dispatch_snapshots();
 
-        // Stage 6: emit telemetry
+        // Stage 6: emit entity snapshot for admin canvas at reduced rate (5 Hz)
+        if self.tick % 4 == 0 {
+            self.emit_entity_snapshot(outbox);
+        }
+
+        // Stage 7: emit telemetry
         let tick_duration_ms = tick_start.elapsed().as_secs_f32() * 1000.0;
         self.emit_telemetry(outbox, tick_duration_ms);
     }
@@ -571,6 +618,64 @@ impl Zone {
         for player_id in disconnected {
             self.remove_entity(player_id);
         }
+    }
+
+    /// Build and emit a [`ZoneEvent::EntitySnapshot`] for the admin world view.
+    ///
+    /// Queries all entities with a [`Position`] component and builds a lightweight
+    /// [`AdminEntity`] for each. Player entities include their [`Label`] as the
+    /// display name.
+    fn emit_entity_snapshot(&self, outbox: &SyncSender<ZoneEvent>) {
+        use common::{AdminEntity, ZoneEntitySnapshot};
+
+        let mut entities = Vec::new();
+
+        // Players: have Position + Player + Label
+        for (_, (pos, player, label)) in self
+            .world
+            .query::<(&Position, &Player, &Label)>()
+            .iter()
+        {
+            entities.push(AdminEntity {
+                entity_id: player.entity_id,
+                kind: EntityKind::Player,
+                position: pos.0,
+                label: label.0.clone(),
+            });
+        }
+
+        // Non-player entities with Position but no Player component.
+        // Phase 1: no mobs/NPCs are spawned yet, but the query is ready.
+        for (hecs_entity, pos) in self.world.query::<&Position>().iter() {
+            // Skip entities already collected (players).
+            if self.world.get::<&Player>(hecs_entity).is_ok() {
+                continue;
+            }
+            // Determine entity_id from reverse map.
+            let entity_id = self
+                .entity_map
+                .iter()
+                .find(|(_, &he)| he == hecs_entity)
+                .map(|(&eid, _)| eid);
+            if let Some(entity_id) = entity_id {
+                entities.push(AdminEntity {
+                    entity_id,
+                    kind: EntityKind::Mob, // Phase 1: all non-players are mobs
+                    position: pos.0,
+                    label: String::new(),
+                });
+            }
+        }
+
+        let snapshot = ZoneEntitySnapshot {
+            zone_id: self.id,
+            aoi_radius: self.aoi_radius,
+            width: self.width,
+            height: self.height,
+            entities,
+        };
+
+        let _ = outbox.try_send(ZoneEvent::EntitySnapshot(snapshot));
     }
 
     /// Emit a [`ZoneEvent::TelemetryUpdate`] to the outbox with current stats.
@@ -811,6 +916,7 @@ mod tests {
             entity_id,
             position: Vec3::new(10.0, 0.0, 20.0),
             snapshot_tx: tx,
+            label: String::new(),
         });
 
         assert_eq!(zone.player_count(), 1);
@@ -829,6 +935,7 @@ mod tests {
             entity_id,
             position: pos,
             snapshot_tx: tx,
+            label: String::new(),
         });
 
         let found = zone.spatial_index.query_radius(pos, 1.0);
@@ -845,6 +952,7 @@ mod tests {
             entity_id,
             position: Vec3::ZERO,
             snapshot_tx: tx,
+            label: String::new(),
         });
         assert_eq!(zone.player_count(), 1);
 
@@ -865,6 +973,7 @@ mod tests {
             entity_id,
             position: pos,
             snapshot_tx: tx,
+            label: String::new(),
         });
         zone.apply(ZoneCommand::PlayerLeave { entity_id });
 
@@ -892,6 +1001,7 @@ mod tests {
             entity_id,
             position: Vec3::ZERO,
             snapshot_tx: tx,
+            label: String::new(),
         });
 
         zone.apply(ZoneCommand::MoveInput {
@@ -917,6 +1027,7 @@ mod tests {
             entity_id,
             position: Vec3::ZERO,
             snapshot_tx: tx,
+            label: String::new(),
         });
 
         // Non-unit direction: (3, 4) has length 5, normalised → (0.6, 0.8)
@@ -942,6 +1053,7 @@ mod tests {
             entity_id,
             position: Vec3::ZERO,
             snapshot_tx: tx,
+            label: String::new(),
         });
 
         zone.apply(ZoneCommand::MoveInput {
@@ -983,6 +1095,7 @@ mod tests {
             entity_id,
             position: Vec3::ZERO,
             snapshot_tx: tx,
+            label: String::new(),
         });
         zone.apply(ZoneCommand::MoveInput {
             entity_id,
@@ -1015,6 +1128,7 @@ mod tests {
             entity_id,
             position: initial_pos,
             snapshot_tx: tx,
+            label: String::new(),
         });
         // No MoveInput — velocity stays at ZERO.
 
@@ -1036,6 +1150,7 @@ mod tests {
             entity_id,
             position: Vec3::ZERO,
             snapshot_tx: tx,
+            label: String::new(),
         });
 
         run_tick(&mut zone, &outbox_tx);
@@ -1060,6 +1175,7 @@ mod tests {
             entity_id,
             position: pos,
             snapshot_tx: tx,
+            label: String::new(),
         });
 
         run_tick(&mut zone, &outbox_tx);
@@ -1095,11 +1211,13 @@ mod tests {
             entity_id: player_a,
             position: pos_a,
             snapshot_tx: tx_a,
+            label: String::new(),
         });
         zone.apply(ZoneCommand::PlayerEnter {
             entity_id: player_b,
             position: pos_b,
             snapshot_tx: tx_b,
+            label: String::new(),
         });
 
         run_tick(&mut zone, &outbox_tx);
@@ -1137,11 +1255,13 @@ mod tests {
             entity_id: player_a,
             position: Vec3::new(0.0, 0.0, 0.0),
             snapshot_tx: tx_a,
+            label: String::new(),
         });
         zone.apply(ZoneCommand::PlayerEnter {
             entity_id: player_b,
             position: Vec3::new(10.0, 0.0, 10.0), // well within AOI
             snapshot_tx: tx_b,
+            label: String::new(),
         });
 
         run_tick(&mut zone, &outbox_tx);
@@ -1163,6 +1283,7 @@ mod tests {
             entity_id: EntityId::new(1),
             position: Vec3::ZERO,
             snapshot_tx: tx,
+            label: String::new(),
         });
 
         run_tick(&mut zone, &outbox_tx);
@@ -1218,6 +1339,7 @@ mod tests {
             entity_id,
             position: pos,
             snapshot_tx: tx,
+            label: String::new(),
         });
 
         run_tick(&mut zone, &outbox_tx);
@@ -1247,6 +1369,7 @@ mod tests {
             entity_id,
             position: Vec3::ZERO,
             snapshot_tx: tx,
+            label: String::new(),
         });
         zone.apply(ZoneCommand::MoveInput {
             entity_id,
@@ -1279,6 +1402,7 @@ mod tests {
             entity_id,
             position: Vec3::ZERO,
             snapshot_tx: tx,
+            label: String::new(),
         });
         // No MoveInput → velocity remains ZERO.
 
@@ -1306,6 +1430,7 @@ mod tests {
             entity_id: EntityId::new(1),
             position: Vec3::ZERO,
             snapshot_tx: tx,
+            label: String::new(),
         });
 
         run_tick(&mut zone, &outbox_tx);
@@ -1330,6 +1455,7 @@ mod tests {
             entity_id,
             position: Vec3::ZERO,
             snapshot_tx: tx,
+            label: String::new(),
         });
         // Use speed=10 (below MAX_PLAYER_SPEED=14) so no clamping occurs.
         // 5 ticks × 0.05 s × 10 u/s = 2.5 u of movement in Z.

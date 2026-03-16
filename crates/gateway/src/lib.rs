@@ -25,16 +25,23 @@
 //!   Routing is done through generic [`RoutedCommand`] values; `game-server`
 //!   wires the concrete zone inbox at startup.
 
+pub mod character_store;
+
 use std::net::SocketAddr;
+use std::sync::Arc;
 
 use bytes::Bytes;
-use common::{EntityId, ZoneId};
+use common::{EntityId, Vec3, ZoneId};
+use jsonwebtoken::{decode, DecodingKey, Validation};
+use jsonwebtoken::errors::ErrorKind as JwtErrorKind;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt, BufReader},
     net::tcp::{OwnedReadHalf, OwnedWriteHalf},
-    sync::mpsc,
+    sync::{mpsc, oneshot},
 };
 use tracing::{debug, warn};
+
+use character_store::CharacterStore;
 
 pub use protocol;
 
@@ -67,17 +74,13 @@ pub enum GatewayError {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Tracks where a connection currently is in the session lifecycle.
-///
-/// A connection starts in [`SessionState::Handshaking`] and transitions to
-/// [`SessionState::Connected`] once the gateway has validated the token and
-/// admitted the client into a zone. Only `Connected` sessions may receive
-/// routed zone commands.
 #[derive(Debug, Clone)]
 pub enum SessionState {
-    /// Token not yet validated — waiting for the [`protocol::ClientMessage::Handshake`].
+    /// Token not yet validated.
     Handshaking,
-
-    /// Token accepted. The client controls `entity_id` inside `zone_id`.
+    /// Token validated, client is selecting a character.
+    CharacterSelect,
+    /// Character selected — client controls `entity_id` inside `zone_id`.
     Connected { entity_id: EntityId, zone_id: ZoneId },
 }
 
@@ -86,29 +89,13 @@ pub enum SessionState {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// A serialised payload destined for a specific UDP address.
-///
-/// Connection tasks produce these and forward them to the single
-/// [`run_udp_dispatch`] task that owns the socket.
 #[derive(Debug)]
 pub struct UdpPacket {
-    /// Pre-serialised bytes to send.
     pub payload: Bytes,
-    /// Destination socket address of the client.
     pub addr: SocketAddr,
 }
 
 /// Owns the UDP socket exclusively and forwards outbound packets.
-///
-/// This is spawned once at server startup. Connection tasks send
-/// `(payload, addr)` through the `rx` channel; this task calls
-/// `socket.send_to` without any locking.
-///
-/// The loop ends when all senders are dropped (channel closed), allowing
-/// graceful shutdown.
-///
-/// # Note
-/// The socket is never shared — no `Arc` is needed. This is the only place
-/// in the codebase that calls `send_to`.
 pub async fn run_udp_dispatch(socket: tokio::net::UdpSocket, mut rx: mpsc::Receiver<UdpPacket>) {
     while let Some(pkt) = rx.recv().await {
         match socket.send_to(&pkt.payload, pkt.addr).await {
@@ -128,52 +115,24 @@ pub async fn run_udp_dispatch(socket: tokio::net::UdpSocket, mut rx: mpsc::Recei
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// A [`protocol::ClientMessage`] tagged with the originating entity.
-///
-/// The `game-server` crate reads from [`GatewayHandle::immediate_rx`] or
-/// [`GatewayHandle::deferred_rx`] and forwards to the appropriate zone inbox
-/// or async service.
 #[derive(Debug)]
 pub struct RoutedCommand {
-    /// The entity that sent this message (only valid once [`SessionState::Connected`]).
     pub entity_id: EntityId,
-    /// The decoded message from the client.
     pub message: protocol::ClientMessage,
 }
 
 /// How to route client messages out of the gateway.
-///
-/// `game-server` creates this (via [`GatewayHandle`]) and passes it into each
-/// connection task. The gateway never depends on the concrete zone type — it
-/// just pushes [`RoutedCommand`] values down these channels.
 #[derive(Clone, Debug)]
 pub struct ClientRouter {
-    /// Immediate messages (movement, spell cast, interact) — forwarded to the
-    /// zone inbox, processed on the current or next tick.
     pub immediate_tx: mpsc::UnboundedSender<RoutedCommand>,
-
-    /// Deferred messages (chat, AH, mail) — forwarded to async service tasks;
-    /// they never touch zone state directly.
     pub deferred_tx: mpsc::UnboundedSender<RoutedCommand>,
 }
 
-/// Classify a [`protocol::ClientMessage`] variant into immediate or deferred.
-///
-/// Rule:
-/// - [`protocol::ClientMessage::MoveInput`] → **immediate** (zone inbox, this tick)
-/// - [`protocol::ClientMessage::Handshake`] → handled internally by the connection
-///   task; never forwarded.
-/// - [`protocol::ClientMessage::Ping`] → handled internally (Pong reply).
-/// - [`protocol::ClientMessage::Disconnect`] → handled internally.
-///
-/// As the protocol grows (Phase 3+), chat/AH/mail variants go to `deferred`.
-/// For Phase 1 the only routed message is `MoveInput`.
+/// Classification of a client message for routing purposes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MessageClass {
-    /// Route to the zone inbox via `immediate_tx`.
     Immediate,
-    /// Route to an async service via `deferred_tx`.
     Deferred,
-    /// Handled internally by the connection task — do not forward.
     Internal,
 }
 
@@ -181,19 +140,17 @@ pub enum MessageClass {
 pub fn classify(msg: &protocol::ClientMessage) -> MessageClass {
     match msg {
         protocol::ClientMessage::MoveInput(_) => MessageClass::Immediate,
-        // Phase 1: Handshake, Ping, Disconnect are all handled inside the
-        // connection task. No deferred messages exist yet in Phase 1.
         protocol::ClientMessage::Handshake(_)
         | protocol::ClientMessage::Ping(_)
-        | protocol::ClientMessage::Disconnect => MessageClass::Internal,
+        | protocol::ClientMessage::Disconnect
+        | protocol::ClientMessage::CharacterListRequest(_)
+        | protocol::ClientMessage::CreateCharacter(_)
+        | protocol::ClientMessage::DeleteCharacter(_)
+        | protocol::ClientMessage::SelectCharacter(_) => MessageClass::Internal,
     }
 }
 
 impl ClientRouter {
-    /// Route a command to the correct channel based on its classification.
-    ///
-    /// Returns `Err(GatewayError::ChannelClosed)` if the receiving end has
-    /// been dropped.
     pub fn route(&self, cmd: RoutedCommand) -> Result<(), GatewayError> {
         let class = classify(&cmd.message);
         match class {
@@ -206,8 +163,6 @@ impl ClientRouter {
                 .send(cmd)
                 .map_err(|_| GatewayError::ChannelClosed),
             MessageClass::Internal => {
-                // Internal messages are never passed to route(); callers should
-                // handle them before calling this function.
                 warn!("route() called with an internal message — dropping");
                 Ok(())
             }
@@ -219,36 +174,13 @@ impl ClientRouter {
 // GatewayHandle
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// The public interface returned when the gateway is started.
-///
-/// `game-server` holds this and reads routed commands from the two receivers,
-/// then forwards them to zone inboxes or service tasks.
 pub struct GatewayHandle {
-    /// Immediate commands (e.g. `MoveInput`) that must reach the zone inbox
-    /// before or during the next tick.
     pub immediate_rx: mpsc::UnboundedReceiver<RoutedCommand>,
-
-    /// Deferred commands (chat, AH, mail) forwarded to async service tasks.
     pub deferred_rx: mpsc::UnboundedReceiver<RoutedCommand>,
-
-    /// Pre-wired router ready to hand to connection tasks.
-    ///
-    /// Clone it once per connection. The underlying unbounded channels are
-    /// cheap to clone (just a sender handle increment).
     pub router: ClientRouter,
 }
 
 impl GatewayHandle {
-    /// Create a new `GatewayHandle`, returning both the handle and the router
-    /// that connection tasks will use.
-    ///
-    /// Typically called once at server startup inside `game-server`.
-    ///
-    /// ```rust
-    /// let handle = gateway::GatewayHandle::new();
-    /// // hand handle.router.clone() to each ConnectionTask
-    /// // read handle.immediate_rx / handle.deferred_rx in the coordinator
-    /// ```
     pub fn new() -> Self {
         let (immediate_tx, immediate_rx) = mpsc::unbounded_channel();
         let (deferred_tx, deferred_rx) = mpsc::unbounded_channel();
@@ -274,32 +206,12 @@ impl Default for GatewayHandle {
 // TCP framing
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Size of the 4-byte little-endian frame-length prefix.
 const FRAME_LEN_SIZE: usize = 4;
 
 /// Read one length-prefixed TCP frame and return the decoded header and payload.
-///
-/// # Frame format
-/// ```text
-/// ┌──────────────┬──────────────────────────┬──────────────┐
-/// │  frame_len   │      PacketHeader        │   payload    │
-/// │   u32 LE     │       11 bytes           │  N bytes     │
-/// │   4 bytes    │  (counted in frame_len)  │              │
-/// └──────────────┴──────────────────────────┴──────────────┘
-/// frame_len = HEADER_SIZE + payload_len
-/// ```
-///
-/// The function reads exactly `frame_len` bytes after the prefix and decodes
-/// the header, then slices the payload from what remains.
-///
-/// # Errors
-/// - [`GatewayError::ConnectionClosed`] if the peer closed the connection.
-/// - [`GatewayError::Io`] for other I/O errors.
-/// - [`GatewayError::Protocol`] if the header cannot be decoded.
 pub async fn read_tcp_message(
     stream: &mut BufReader<OwnedReadHalf>,
 ) -> Result<(protocol::PacketHeader, Vec<u8>), GatewayError> {
-    // Read 4-byte frame length prefix.
     let mut len_buf = [0u8; FRAME_LEN_SIZE];
     match stream.read_exact(&mut len_buf).await {
         Ok(_) => {}
@@ -311,11 +223,9 @@ pub async fn read_tcp_message(
     let frame_len = u32::from_le_bytes(len_buf) as usize;
 
     if frame_len < protocol::HEADER_SIZE {
-        // Frame is smaller than a header — definitely malformed.
         return Err(GatewayError::Protocol(protocol::ProtocolError::HeaderTooShort));
     }
 
-    // Read the rest of the frame (header + payload).
     let mut frame = vec![0u8; frame_len];
     match stream.read_exact(&mut frame).await {
         Ok(_) => {}
@@ -325,7 +235,6 @@ pub async fn read_tcp_message(
         Err(e) => return Err(GatewayError::Io(e)),
     }
 
-    // Decode the 11-byte header from the front of the frame.
     let header = protocol::PacketHeader::decode_slice(&frame)?;
     let payload = frame[protocol::HEADER_SIZE..].to_vec();
 
@@ -333,12 +242,6 @@ pub async fn read_tcp_message(
 }
 
 /// Write one length-prefixed TCP frame.
-///
-/// # Frame format
-/// Same as [`read_tcp_message`]: 4-byte LE length prefix, then header, then payload.
-///
-/// # Errors
-/// - [`GatewayError::Io`] for I/O errors.
 pub async fn write_tcp_message(
     stream: &mut OwnedWriteHalf,
     header: &protocol::PacketHeader,
@@ -347,8 +250,6 @@ pub async fn write_tcp_message(
     let header_bytes = header.encode();
     let frame_len = (protocol::HEADER_SIZE + payload.len()) as u32;
 
-    // Write frame length prefix, header, and payload as a single gathered write
-    // to avoid partial-frame problems.
     let mut buf =
         Vec::with_capacity(FRAME_LEN_SIZE + protocol::HEADER_SIZE + payload.len());
     buf.extend_from_slice(&frame_len.to_le_bytes());
@@ -360,8 +261,32 @@ pub async fn write_tcp_message(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Auth config
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Auth configuration threaded into every connection task.
+///
+/// - `jwt_secret`: HMAC-SHA256 key used to verify JWTs issued by login-server.
+/// - `redis_client`: checked once at connect to query the token blocklist.
+/// - `skip_validation`: dev/test mode — accept any token without real validation.
+#[derive(Clone)]
+pub struct GatewayAuth {
+    pub jwt_secret: Vec<u8>,
+    pub redis_client: redis::Client,
+    pub skip_validation: bool,
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // ConnectionTask
 // ─────────────────────────────────────────────────────────────────────────────
+
+/// Request from the connection task to the game-server to place a player in a zone.
+#[derive(Debug)]
+pub struct EnterZoneRequest {
+    pub zone_id: ZoneId,
+    pub position: Vec3,
+    pub label: String,
+}
 
 /// Configuration required to spawn a [`run_connection`] task.
 pub struct ConnectionConfig {
@@ -374,31 +299,46 @@ pub struct ConnectionConfig {
     /// Pre-built router for forwarding decoded client messages.
     pub router: ClientRouter,
 
-    /// Receiver for [`protocol::WorldSnapshot`] messages coming from the zone.
-    ///
-    /// The zone sends a snapshot every tick; the connection task serialises it
-    /// and forwards it to `udp_tx` for dispatch.
-    pub snapshot_rx: mpsc::Receiver<protocol::WorldSnapshot>,
+    /// Auth configuration (JWT secret + Redis blocklist + dev-mode flag).
+    pub auth: GatewayAuth,
+
+    /// Entity ID pre-assigned by game-server before this task is spawned.
+    pub entity_id: EntityId,
+
+    /// Character store for the character selection phase.
+    pub character_store: Arc<dyn CharacterStore>,
+
+    /// Signal back to game-server: `Some(account_uuid)` = JWT valid;
+    /// `None` = rejected, skip everything.
+    pub validated_tx: oneshot::Sender<Option<String>>,
+
+    /// Receives auth result from game-server (duplicate login check).
+    /// `Ok(())` = proceed to character selection.
+    /// `Err(reason)` = rejected.
+    pub auth_result_rx: oneshot::Receiver<Result<(), protocol::RejectReason>>,
+
+    /// Send zone placement request after character selection.
+    pub enter_zone_tx: mpsc::Sender<EnterZoneRequest>,
+
+    /// Receives the async snapshot channel from game-server after PlayerEnter.
+    /// `Ok(rx)` = proceed with HandshakeAccepted.
+    /// `Err(reason)` = game-server rejected.
+    pub snapshot_rx_source: oneshot::Receiver<Result<mpsc::Receiver<protocol::WorldSnapshot>, protocol::RejectReason>>,
 }
 
 /// Run the async task that manages one TCP connection.
 ///
-/// This task:
-/// 1. Drives the session state machine (Handshaking → Connected).
-/// 2. Reads inbound TCP frames via [`read_tcp_message`] and routes them:
-///    - `Ping` → immediate `Pong` reply over TCP.
-///    - `MoveInput` → forwarded to `router.immediate_tx` (zone inbox).
-///    - `Disconnect` → task exits.
-///    - `Handshake` → validated here (stub: any non-empty token accepted).
-/// 3. Forwards incoming `WorldSnapshot` values from `snapshot_rx` to the UDP
-///    dispatch task.
+/// ## Three-phase design
 ///
-/// The task exits on disconnect, I/O error, or channel closure.
+/// **Phase 1 — Handshake**: wait for a `Handshake` message, validate the JWT
+/// (real or dev-mode), signal game-server via `validated_tx`, await auth result.
 ///
-/// # Stub auth note
-/// Phase 1 does not have a real auth server. Any non-empty token string is
-/// accepted and a fixed `EntityId(1)` / `ZoneId(1)` is assigned. Phase 2 will
-/// replace this with JWT validation + Redis blocklist check.
+/// **Phase 2 — Character Selection**: handle CharacterListRequest, CreateCharacter,
+/// DeleteCharacter. On SelectCharacter, load full info, signal game-server to
+/// place the player in a zone, send HandshakeAccepted.
+///
+/// **Phase 3 — Connected**: select loop forwarding zone snapshots via UDP and
+/// routing inbound client messages.
 pub async fn run_connection(
     tcp_read: OwnedReadHalf,
     mut tcp_write: OwnedWriteHalf,
@@ -408,14 +348,298 @@ pub async fn run_connection(
         peer_addr,
         udp_tx,
         router,
-        mut snapshot_rx,
+        auth,
+        entity_id,
+        character_store,
+        validated_tx,
+        auth_result_rx,
+        enter_zone_tx,
+        snapshot_rx_source,
     } = config;
 
     let mut reader = BufReader::new(tcp_read);
-    let mut session = SessionState::Handshaking;
-    // Per-connection monotonically increasing sequence counter.
     let mut seq: u32 = 0;
 
+    // ── Phase 1: Handshake ────────────────────────────────────────────────────
+    let account_uuid = 'handshake: loop {
+        match read_tcp_message(&mut reader).await {
+            Err(GatewayError::ConnectionClosed) => {
+                debug!(addr = %peer_addr, "disconnected before handshake");
+                let _ = validated_tx.send(None);
+                return;
+            }
+            Err(e) => {
+                warn!(addr = %peer_addr, error = %e, "tcp error before handshake");
+                let _ = validated_tx.send(None);
+                return;
+            }
+            Ok((header, payload)) => {
+                let msg = match protocol::decode_client(&header, &payload) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        warn!(addr = %peer_addr, error = %e, "protocol error before handshake");
+                        let _ = validated_tx.send(None);
+                        return;
+                    }
+                };
+
+                match msg {
+                    protocol::ClientMessage::Handshake(hs) => {
+                        seq = seq.wrapping_add(1);
+                        match validate_token(&hs.token, &auth).await {
+                            Ok(claims) => {
+                                let account = claims.sub.clone();
+                                if validated_tx.send(Some(claims.sub)).is_err() {
+                                    return;
+                                }
+                                // Wait for game-server auth result (duplicate login check).
+                                match auth_result_rx.await {
+                                    Ok(Ok(())) => {
+                                        break 'handshake account;
+                                    }
+                                    Ok(Err(reason)) => {
+                                        let reply = protocol::ServerMessage::HandshakeRejected(
+                                            protocol::HandshakeRejected { reason },
+                                        );
+                                        if let Ok((hdr, pl)) = protocol::encode_server(&reply, seq) {
+                                            let _ = write_tcp_message(&mut tcp_write, &hdr, &pl).await;
+                                        }
+                                        debug!(addr = %peer_addr, ?reason, "handshake rejected by game-server");
+                                        return;
+                                    }
+                                    Err(_) => return,
+                                }
+                            }
+                            Err(reason) => {
+                                let reply = protocol::ServerMessage::HandshakeRejected(
+                                    protocol::HandshakeRejected { reason },
+                                );
+                                if let Ok((hdr, pl)) = protocol::encode_server(&reply, seq) {
+                                    let _ = write_tcp_message(&mut tcp_write, &hdr, &pl).await;
+                                }
+                                let _ = validated_tx.send(None);
+                                debug!(addr = %peer_addr, ?reason, "handshake rejected");
+                                return;
+                            }
+                        }
+                    }
+
+                    protocol::ClientMessage::Ping(ping) => {
+                        seq = seq.wrapping_add(1);
+                        send_pong(&mut tcp_write, &mut seq, ping.client_timestamp).await;
+                    }
+
+                    protocol::ClientMessage::Disconnect => {
+                        debug!(addr = %peer_addr, "disconnect before handshake");
+                        let _ = validated_tx.send(None);
+                        return;
+                    }
+
+                    other => {
+                        warn!(
+                            addr = %peer_addr,
+                            msg = ?other,
+                            "non-Handshake before session established — dropping connection"
+                        );
+                        let _ = validated_tx.send(None);
+                        return;
+                    }
+                }
+            }
+        }
+    };
+
+    // ── Phase 2: Character Selection ──────────────────────────────────────────
+    let mut snapshot_rx = 'char_select: loop {
+        match read_tcp_message(&mut reader).await {
+            Err(GatewayError::ConnectionClosed) => {
+                debug!(addr = %peer_addr, "disconnected during character selection");
+                return;
+            }
+            Err(e) => {
+                warn!(addr = %peer_addr, error = %e, "tcp error during character selection");
+                return;
+            }
+            Ok((header, payload)) => {
+                let msg = match protocol::decode_client(&header, &payload) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        warn!(addr = %peer_addr, error = %e, "protocol error during character selection");
+                        return;
+                    }
+                };
+
+                match msg {
+                    protocol::ClientMessage::CharacterListRequest(_) => {
+                        seq = seq.wrapping_add(1);
+                        match character_store.list(&account_uuid).await {
+                            Ok(characters) => {
+                                let reply = protocol::ServerMessage::CharacterList(
+                                    protocol::CharacterList { characters },
+                                );
+                                if let Ok((hdr, pl)) = protocol::encode_server(&reply, seq) {
+                                    let _ = write_tcp_message(&mut tcp_write, &hdr, &pl).await;
+                                }
+                            }
+                            Err(e) => {
+                                warn!(addr = %peer_addr, error = %e, "character list failed");
+                            }
+                        }
+                    }
+
+                    protocol::ClientMessage::CreateCharacter(req) => {
+                        seq = seq.wrapping_add(1);
+                        match character_store
+                            .create(&account_uuid, &req.name, req.race, req.class)
+                            .await
+                        {
+                            Ok(character) => {
+                                let reply = protocol::ServerMessage::CharacterCreated(
+                                    protocol::CharacterCreated { character },
+                                );
+                                if let Ok((hdr, pl)) = protocol::encode_server(&reply, seq) {
+                                    let _ = write_tcp_message(&mut tcp_write, &hdr, &pl).await;
+                                }
+                            }
+                            Err(e) => {
+                                let reply = protocol::ServerMessage::CharacterCreateFailed(
+                                    protocol::CharacterCreateFailed {
+                                        reason: e.to_string(),
+                                    },
+                                );
+                                if let Ok((hdr, pl)) = protocol::encode_server(&reply, seq) {
+                                    let _ = write_tcp_message(&mut tcp_write, &hdr, &pl).await;
+                                }
+                            }
+                        }
+                    }
+
+                    protocol::ClientMessage::DeleteCharacter(req) => {
+                        seq = seq.wrapping_add(1);
+                        match character_store
+                            .delete(&account_uuid, req.character_id.get())
+                            .await
+                        {
+                            Ok(()) => {
+                                let reply = protocol::ServerMessage::CharacterDeleted(
+                                    protocol::CharacterDeleted {
+                                        character_id: req.character_id,
+                                    },
+                                );
+                                if let Ok((hdr, pl)) = protocol::encode_server(&reply, seq) {
+                                    let _ = write_tcp_message(&mut tcp_write, &hdr, &pl).await;
+                                }
+                            }
+                            Err(e) => {
+                                warn!(addr = %peer_addr, error = %e, "character delete failed");
+                            }
+                        }
+                    }
+
+                    protocol::ClientMessage::SelectCharacter(req) => {
+                        seq = seq.wrapping_add(1);
+                        match character_store
+                            .get_full(&account_uuid, req.character_id.get())
+                            .await
+                        {
+                            Ok(full) => {
+                                let zone_id = full.zone_id;
+                                let position = full.position;
+                                let label = full.name.clone();
+
+                                // Tell game-server to place this player.
+                                if enter_zone_tx
+                                    .send(EnterZoneRequest {
+                                        zone_id,
+                                        position,
+                                        label,
+                                    })
+                                    .await
+                                    .is_err()
+                                {
+                                    return;
+                                }
+
+                                // Wait for snapshot channel.
+                                match snapshot_rx_source.await {
+                                    Ok(Ok(rx)) => {
+                                        let reply =
+                                            protocol::ServerMessage::HandshakeAccepted(
+                                                protocol::HandshakeAccepted {
+                                                    entity_id,
+                                                    zone_id,
+                                                },
+                                            );
+                                        let (hdr, pl) = match protocol::encode_server(&reply, seq) {
+                                            Ok(v) => v,
+                                            Err(e) => {
+                                                warn!(addr = %peer_addr, error = %e, "encode HandshakeAccepted");
+                                                return;
+                                            }
+                                        };
+                                        if let Err(e) =
+                                            write_tcp_message(&mut tcp_write, &hdr, &pl).await
+                                        {
+                                            warn!(addr = %peer_addr, error = %e, "write HandshakeAccepted");
+                                            return;
+                                        }
+                                        debug!(
+                                            addr = %peer_addr,
+                                            entity = ?entity_id,
+                                            zone = ?zone_id,
+                                            "character selected, entering world"
+                                        );
+                                        break 'char_select rx;
+                                    }
+                                    Ok(Err(reason)) => {
+                                        let reply = protocol::ServerMessage::HandshakeRejected(
+                                            protocol::HandshakeRejected { reason },
+                                        );
+                                        if let Ok((hdr, pl)) = protocol::encode_server(&reply, seq) {
+                                            let _ = write_tcp_message(&mut tcp_write, &hdr, &pl).await;
+                                        }
+                                        return;
+                                    }
+                                    Err(_) => return,
+                                }
+                            }
+                            Err(e) => {
+                                // Character not found — send create-failed as error feedback.
+                                let reply = protocol::ServerMessage::CharacterCreateFailed(
+                                    protocol::CharacterCreateFailed {
+                                        reason: e.to_string(),
+                                    },
+                                );
+                                if let Ok((hdr, pl)) = protocol::encode_server(&reply, seq) {
+                                    let _ = write_tcp_message(&mut tcp_write, &hdr, &pl).await;
+                                }
+                            }
+                        }
+                    }
+
+                    protocol::ClientMessage::Ping(ping) => {
+                        seq = seq.wrapping_add(1);
+                        send_pong(&mut tcp_write, &mut seq, ping.client_timestamp).await;
+                    }
+
+                    protocol::ClientMessage::Disconnect => {
+                        debug!(addr = %peer_addr, "disconnect during character selection");
+                        return;
+                    }
+
+                    other => {
+                        warn!(
+                            addr = %peer_addr,
+                            msg = ?other,
+                            "unexpected message during character selection"
+                        );
+                    }
+                }
+            }
+        }
+    };
+
+    // ── Phase 2: Connected — select loop ──────────────────────────────────────
     loop {
         tokio::select! {
             // Inbound TCP frame from the client.
@@ -426,26 +650,29 @@ pub async fn run_connection(
                         break;
                     }
                     Err(e) => {
-                        warn!(addr = %peer_addr, error = %e, "tcp read error, dropping connection");
+                        warn!(addr = %peer_addr, error = %e, "tcp read error");
                         break;
                     }
                     Ok((header, payload)) => {
-                        match handle_inbound(
-                            &header,
-                            &payload,
-                            &mut session,
-                            &mut seq,
-                            &mut tcp_write,
-                            &router,
-                            peer_addr,
-                        )
-                        .await
-                        {
-                            Ok(KeepGoing::Yes) => {}
-                            Ok(KeepGoing::No) => break,
+                        match protocol::decode_client(&header, &payload) {
                             Err(e) => {
-                                warn!(addr = %peer_addr, error = %e, "error handling message");
+                                warn!(addr = %peer_addr, error = %e, "protocol error");
                                 break;
+                            }
+                            Ok(msg) => {
+                                match handle_connected(
+                                    msg,
+                                    &mut seq,
+                                    &mut tcp_write,
+                                    &router,
+                                    entity_id,
+                                    peer_addr,
+                                )
+                                .await
+                                {
+                                    Ok(KeepGoing::Yes) => {}
+                                    Ok(KeepGoing::No) | Err(_) => break,
+                                }
                             }
                         }
                     }
@@ -456,13 +683,13 @@ pub async fn run_connection(
             snapshot = snapshot_rx.recv() => {
                 match snapshot {
                     None => {
-                        debug!(addr = %peer_addr, "snapshot channel closed, dropping connection");
+                        debug!(addr = %peer_addr, "snapshot channel closed");
                         break;
                     }
                     Some(snap) => {
                         if let Err(e) = forward_snapshot(snap, seq, peer_addr, &udp_tx).await {
-                            warn!(addr = %peer_addr, error = %e, "failed to forward snapshot");
-                            // Non-fatal: UDP is best-effort. Continue.
+                            warn!(addr = %peer_addr, error = %e, "snapshot forward failed");
+                            // Non-fatal: UDP is best-effort.
                         }
                         seq = seq.wrapping_add(1);
                     }
@@ -472,47 +699,21 @@ pub async fn run_connection(
     }
 }
 
-/// Drives the per-message logic for one inbound TCP frame.
-async fn handle_inbound(
-    header: &protocol::PacketHeader,
-    payload: &[u8],
-    session: &mut SessionState,
+// ─────────────────────────────────────────────────────────────────────────────
+// Connected-phase message handler
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Handle one inbound message in the connected phase.
+async fn handle_connected(
+    msg: protocol::ClientMessage,
     seq: &mut u32,
     tcp_write: &mut OwnedWriteHalf,
     router: &ClientRouter,
+    entity_id: EntityId,
     peer_addr: SocketAddr,
 ) -> Result<KeepGoing, GatewayError> {
-    let msg = protocol::decode_client(header, payload)?;
-
-    match (&session, &msg) {
-        // ── Handshake ────────────────────────────────────────────────────
-        (SessionState::Handshaking, protocol::ClientMessage::Handshake(hs)) => {
-            let (accepted, entity_id, zone_id) = validate_token(&hs.token);
-            *seq = seq.wrapping_add(1);
-
-            if accepted {
-                *session = SessionState::Connected { entity_id, zone_id };
-                let reply = protocol::ServerMessage::HandshakeAccepted(
-                    protocol::HandshakeAccepted { entity_id, zone_id },
-                );
-                let (hdr, pl) = protocol::encode_server(&reply, *seq)?;
-                write_tcp_message(tcp_write, &hdr, &pl).await?;
-                debug!(addr = %peer_addr, entity = ?entity_id, zone = ?zone_id, "handshake accepted");
-            } else {
-                let reply = protocol::ServerMessage::HandshakeRejected(
-                    protocol::HandshakeRejected {
-                        reason: protocol::RejectReason::InvalidToken,
-                    },
-                );
-                let (hdr, pl) = protocol::encode_server(&reply, *seq)?;
-                write_tcp_message(tcp_write, &hdr, &pl).await?;
-                debug!(addr = %peer_addr, "handshake rejected — invalid token");
-                return Ok(KeepGoing::No);
-            }
-        }
-
-        // ── Ping ─────────────────────────────────────────────────────────
-        (_, protocol::ClientMessage::Ping(ping)) => {
+    match msg {
+        protocol::ClientMessage::Ping(ping) => {
             *seq = seq.wrapping_add(1);
             let server_ts = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -526,35 +727,36 @@ async fn handle_inbound(
             write_tcp_message(tcp_write, &hdr, &pl).await?;
         }
 
-        // ── Disconnect ───────────────────────────────────────────────────
-        (_, protocol::ClientMessage::Disconnect) => {
+        protocol::ClientMessage::Disconnect => {
             debug!(addr = %peer_addr, "client sent Disconnect");
             return Ok(KeepGoing::No);
         }
 
-        // ── MoveInput (and future immediate messages) ─────────────────────
-        (SessionState::Connected { entity_id, .. }, _) => {
-            let class = classify(&msg);
+        // A second Handshake after session is established is a protocol error.
+        protocol::ClientMessage::Handshake(_) => {
+            warn!(addr = %peer_addr, "duplicate Handshake after session established — dropping");
+            return Ok(KeepGoing::No);
+        }
+
+        other => {
+            let class = classify(&other);
             if class != MessageClass::Internal {
                 let cmd = RoutedCommand {
-                    entity_id: *entity_id,
-                    message: msg,
+                    entity_id,
+                    message: other,
                 };
                 router.route(cmd)?;
             }
-        }
-
-        // ── Message before handshake (non-handshake message while Handshaking)
-        (SessionState::Handshaking, other) => {
-            warn!(addr = %peer_addr, msg = ?other, "received non-Handshake before session established — dropping");
-            return Ok(KeepGoing::No);
         }
     }
 
     Ok(KeepGoing::Yes)
 }
 
-/// Serialise and forward a [`protocol::WorldSnapshot`] to the UDP dispatch task.
+// ─────────────────────────────────────────────────────────────────────────────
+// Snapshot forwarding
+// ─────────────────────────────────────────────────────────────────────────────
+
 async fn forward_snapshot(
     snapshot: protocol::WorldSnapshot,
     seq: u32,
@@ -564,7 +766,6 @@ async fn forward_snapshot(
     let msg = protocol::ServerMessage::WorldSnapshot(snapshot);
     let (header, payload) = protocol::encode_server(&msg, seq)?;
 
-    // Build the wire frame: 4-byte length prefix + header + payload.
     let frame_len = (protocol::HEADER_SIZE + payload.len()) as u32;
     let mut buf = Vec::with_capacity(FRAME_LEN_SIZE + protocol::HEADER_SIZE + payload.len());
     buf.extend_from_slice(&frame_len.to_le_bytes());
@@ -579,33 +780,86 @@ async fn forward_snapshot(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Token validation stub (Phase 1)
+// Token validation
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Phase 1 stub: accept any non-empty token and assign fixed ids.
+/// Validate a JWT token string.
 ///
-/// Phase 2 will replace this with JWT verification against the auth-server's
-/// public key, then check the token ID against the Redis blocklist.
-fn validate_token(token: &str) -> (bool, EntityId, ZoneId) {
-    if token.is_empty() {
-        (false, EntityId::new(0), ZoneId::new(0))
-    } else {
-        // In Phase 1 every client gets entity 1 in zone 1. The real
-        // implementation will extract entity/zone from the JWT claims.
-        (true, EntityId::new(1), ZoneId::new(1))
+/// - In dev mode (`skip_validation = true`): return fake claims immediately.
+/// - Otherwise: verify the JWT signature and expiry, then check the Redis
+///   blocklist using the `jti` claim. Returns the validated claims on success.
+async fn validate_token(
+    token: &str,
+    auth: &GatewayAuth,
+) -> Result<protocol::AuthClaims, protocol::RejectReason> {
+    if auth.skip_validation {
+        // Dev mode: skip real validation so developers can test without a
+        // running login-server. The token string is used as a fake subject.
+        return Ok(protocol::AuthClaims {
+            sub: token.to_string(),
+            jti: token.to_string(),
+            iat: 0,
+            exp: usize::MAX,
+        });
     }
+
+    // 1. Decode and verify the JWT signature and expiry.
+    let token_data = decode::<protocol::AuthClaims>(
+        token,
+        &DecodingKey::from_secret(&auth.jwt_secret),
+        &Validation::default(),
+    )
+    .map_err(|e| {
+        if e.kind() == &JwtErrorKind::ExpiredSignature {
+            protocol::RejectReason::ExpiredToken
+        } else {
+            protocol::RejectReason::InvalidToken
+        }
+    })?;
+
+    // 2. Redis blocklist check — reject if the jti has been revoked.
+    let mut conn = auth
+        .redis_client
+        .get_async_connection()
+        .await
+        .map_err(|_| protocol::RejectReason::InvalidToken)?;
+
+    let blocked: bool = redis::cmd("EXISTS")
+        .arg(&token_data.claims.jti)
+        .query_async(&mut conn)
+        .await
+        .unwrap_or(false);
+
+    if blocked {
+        return Err(protocol::RejectReason::InvalidToken);
+    }
+
+    Ok(token_data.claims)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Internal helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Signal returned from [`handle_inbound`] to tell the connection loop whether
-/// to continue or exit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum KeepGoing {
     Yes,
     No,
+}
+
+/// Send a Pong reply on the TCP connection.
+async fn send_pong(tcp_write: &mut OwnedWriteHalf, seq: &mut u32, client_timestamp: u64) {
+    let server_ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let reply = protocol::ServerMessage::Pong(protocol::Pong {
+        client_timestamp,
+        server_timestamp: server_ts,
+    });
+    if let Ok((hdr, pl)) = protocol::encode_server(&reply, *seq) {
+        let _ = write_tcp_message(tcp_write, &hdr, &pl).await;
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -615,32 +869,17 @@ enum KeepGoing {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use common::{EntityFlags, EntityId, EntityKind, EntityState, Vec2, Vec3, ZoneId};
+    use common::{EntityFlags, EntityId, EntityKind, EntityState, Vec2, Vec3};
     use protocol::{ClientMessage, Handshake, MoveInput, PacketHeader, Ping, WorldSnapshot};
-    use tokio::io::duplex;
+    use tokio::io::BufReader;
 
     // ── Helpers ──────────────────────────────────────────────────────────────
 
-    /// Build a `BufReader<OwnedReadHalf>` + `OwnedWriteHalf` pair backed by an
-    /// in-memory duplex stream.
-    fn duplex_pair(max_buf: usize) -> (BufReader<OwnedReadHalf>, OwnedWriteHalf) {
-        // tokio::io::duplex gives us a (write_end, read_end) for an in-memory pipe.
-        let (client_side, server_side) = duplex(max_buf);
-        // We need a real TcpStream split, but duplex gives DuplexStream.
-        // Use the tokio::net::tcp::OwnedReadHalf path by going through a
-        // loopback TCP connection instead.
-        // For unit tests we wrap duplex in a helper that does the same job.
-        drop((client_side, server_side));
-        panic!("use tcp_duplex_pair() instead");
-    }
-
-    /// Spin up a loopback TCP connection and return split halves for both ends.
-    /// Returns (writer_to_server, reader_from_server, writer_to_client, reader_from_client).
     async fn tcp_duplex() -> (
-        OwnedWriteHalf,              // client writes here (goes to server read)
-        BufReader<OwnedReadHalf>,    // server reads here
-        OwnedWriteHalf,              // server writes here (goes to client read)
-        BufReader<OwnedReadHalf>,    // client reads here
+        OwnedWriteHalf,
+        BufReader<OwnedReadHalf>,
+        OwnedWriteHalf,
+        BufReader<OwnedReadHalf>,
     ) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -663,12 +902,30 @@ mod tests {
         )
     }
 
+    /// Build a GatewayAuth in skip-validation (dev) mode for tests that don't
+    /// need real JWT or Redis.
+    fn dev_auth() -> GatewayAuth {
+        GatewayAuth {
+            jwt_secret: b"test-secret".to_vec(),
+            redis_client: redis::Client::open("redis://127.0.0.1:6379").unwrap(),
+            skip_validation: true,
+        }
+    }
+
+    /// Build a GatewayAuth in real-validation mode for rejection tests.
+    /// Redis is not needed because the JWT decode fails before the blocklist
+    /// check for invalid tokens.
+    fn real_auth() -> GatewayAuth {
+        GatewayAuth {
+            jwt_secret: b"test-secret".to_vec(),
+            redis_client: redis::Client::open("redis://127.0.0.1:6379").unwrap(),
+            skip_validation: false,
+        }
+    }
+
     // ── Framing: write then read round-trip ──────────────────────────────────
 
-    /// Write a message with write_tcp_message, read it back with read_tcp_message.
-    async fn framing_roundtrip(
-        msg: &ClientMessage,
-    ) -> (PacketHeader, Vec<u8>) {
+    async fn framing_roundtrip(msg: &ClientMessage) -> (PacketHeader, Vec<u8>) {
         let (header_out, payload_out) = protocol::encode_client(msg, 7).unwrap();
 
         let (mut cw, mut sr, _sw, _cr) = tcp_duplex().await;
@@ -707,7 +964,6 @@ mod tests {
 
     #[tokio::test]
     async fn framing_large_world_snapshot() {
-        // Build a snapshot with 100 entities.
         let entities: Vec<EntityState> = (0u64..100).map(make_entity).collect();
         let snap = WorldSnapshot {
             tick: 9999,
@@ -738,7 +994,6 @@ mod tests {
     async fn framing_multiple_messages_sequential() {
         let (mut cw, mut sr, _sw, _cr) = tcp_duplex().await;
 
-        // Write three messages back-to-back.
         let msgs: Vec<ClientMessage> = vec![
             ClientMessage::Handshake(Handshake { token: "abc".into() }),
             ClientMessage::Ping(Ping { client_timestamp: 12345 }),
@@ -789,7 +1044,6 @@ mod tests {
     fn router_routes_move_input_to_immediate() {
         let handle = GatewayHandle::new();
         let router = handle.router.clone();
-        // Use a separate GatewayHandle to hold the receivers so we can inspect them.
         let GatewayHandle { mut immediate_rx, mut deferred_rx, .. } = handle;
 
         let cmd = RoutedCommand {
@@ -801,12 +1055,10 @@ mod tests {
         };
         router.route(cmd).unwrap();
 
-        // immediate_rx should have it.
         let received = immediate_rx.try_recv().expect("should have a command");
         assert_eq!(received.entity_id, EntityId::new(42));
         assert!(matches!(received.message, ClientMessage::MoveInput(_)));
 
-        // deferred_rx should be empty.
         assert!(deferred_rx.try_recv().is_err());
     }
 
@@ -836,7 +1088,6 @@ mod tests {
         let (deferred_tx, deferred_rx) = mpsc::unbounded_channel::<RoutedCommand>();
         let router = ClientRouter { immediate_tx, deferred_tx };
 
-        // Drop the receivers so the channels close.
         drop(immediate_rx);
         drop(deferred_rx);
 
@@ -851,39 +1102,91 @@ mod tests {
         assert!(matches!(err, Err(GatewayError::ChannelClosed)));
     }
 
-    // ── Handshake session state test ─────────────────────────────────────────
+    // ── Handshake tests ──────────────────────────────────────────────────────
 
     #[tokio::test]
     async fn handshake_accepted_for_nonempty_token() {
-        // Wire a full connection task and drive a handshake through it.
+        use character_store::InMemoryCharacterStore;
+        use common::{Race, Class};
+
         let (mut client_w, server_r, server_w, mut client_r) = tcp_duplex().await;
         let (udp_tx, _udp_rx) = mpsc::channel(8);
         let handle = GatewayHandle::new();
         let router = handle.router.clone();
-        let (_snap_tx, snap_rx) = mpsc::channel::<WorldSnapshot>(8);
+
+        let (validated_tx, validated_rx) = oneshot::channel::<Option<String>>();
+        let (auth_result_tx, auth_result_rx) =
+            oneshot::channel::<Result<(), protocol::RejectReason>>();
+        let (enter_zone_tx, mut enter_zone_rx) = mpsc::channel::<EnterZoneRequest>(1);
+        let (snap_source_tx, snap_source_rx) =
+            oneshot::channel::<Result<mpsc::Receiver<WorldSnapshot>, protocol::RejectReason>>();
+
+        let char_store = Arc::new(InMemoryCharacterStore::new());
+        // Pre-create a character so we can select it.
+        let char_info = char_store
+            .create("valid-token", "Hero", Race::Human, Class::Warrior)
+            .await
+            .unwrap();
 
         let config = ConnectionConfig {
             peer_addr: "127.0.0.1:9999".parse().unwrap(),
             udp_tx,
             router,
-            snapshot_rx: snap_rx,
+            auth: dev_auth(),
+            entity_id: EntityId::new(1),
+            character_store: char_store,
+            validated_tx,
+            auth_result_rx,
+            enter_zone_tx,
+            snapshot_rx_source: snap_source_rx,
         };
 
-        // Spawn the connection task.
-        tokio::spawn(run_connection(
-            // unwrap the owned halves from the BufReader
-            server_r.into_inner(),
-            server_w,
-            config,
-        ));
+        tokio::spawn(run_connection(server_r.into_inner(), server_w, config));
 
-        // Client sends a Handshake with a valid (non-empty) token.
+        // Client sends Handshake.
         let hs = ClientMessage::Handshake(Handshake { token: "valid-token".into() });
         let (h, p) = protocol::encode_client(&hs, 1).unwrap();
         write_tcp_message(&mut client_w, &h, &p).await.unwrap();
 
-        // Client should receive HandshakeAccepted.
-        let (rh, rp) = read_tcp_message(&mut client_r).await.unwrap();
+        // Simulate game-server: read validation result, send auth OK.
+        let valid = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            validated_rx,
+        )
+        .await
+        .expect("timed out waiting for validated_rx")
+        .unwrap();
+        assert!(valid.is_some(), "expected validation to succeed");
+        auth_result_tx.send(Ok(())).unwrap();
+
+        // Client sends SelectCharacter.
+        let select = ClientMessage::SelectCharacter(protocol::SelectCharacter {
+            character_id: char_info.id.clone(),
+        });
+        let (h, p) = protocol::encode_client(&select, 2).unwrap();
+        write_tcp_message(&mut client_w, &h, &p).await.unwrap();
+
+        // Simulate game-server: receive EnterZoneRequest, provide snapshot channel.
+        let enter_req = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            enter_zone_rx.recv(),
+        )
+        .await
+        .expect("timed out waiting for enter_zone_rx")
+        .expect("enter_zone channel closed");
+        assert_eq!(enter_req.label, "Hero");
+
+        let (_snap_tx, snap_rx) = mpsc::channel::<WorldSnapshot>(8);
+        snap_source_tx.send(Ok(snap_rx)).unwrap();
+
+        // Client should now receive HandshakeAccepted.
+        let (rh, rp) = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            read_tcp_message(&mut client_r),
+        )
+        .await
+        .expect("timed out waiting for HandshakeAccepted")
+        .unwrap();
         let reply = protocol::decode_server(&rh, &rp).unwrap();
         assert!(
             matches!(reply, protocol::ServerMessage::HandshakeAccepted(_)),
@@ -893,28 +1196,48 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn handshake_rejected_for_empty_token() {
+    async fn handshake_rejected_for_invalid_token() {
+        use character_store::InMemoryCharacterStore;
+
         let (mut client_w, server_r, server_w, mut client_r) = tcp_duplex().await;
         let (udp_tx, _udp_rx) = mpsc::channel(8);
         let handle = GatewayHandle::new();
         let router = handle.router.clone();
-        let (_snap_tx, snap_rx) = mpsc::channel::<WorldSnapshot>(8);
+
+        let (validated_tx, _validated_rx) = oneshot::channel::<Option<String>>();
+        let (_auth_result_tx, auth_result_rx) =
+            oneshot::channel::<Result<(), protocol::RejectReason>>();
+        let (enter_zone_tx, _enter_zone_rx) = mpsc::channel::<EnterZoneRequest>(1);
+        let (_snap_source_tx, snap_source_rx) =
+            oneshot::channel::<Result<mpsc::Receiver<WorldSnapshot>, protocol::RejectReason>>();
 
         let config = ConnectionConfig {
             peer_addr: "127.0.0.1:9998".parse().unwrap(),
             udp_tx,
             router,
-            snapshot_rx: snap_rx,
+            auth: real_auth(),
+            entity_id: EntityId::new(1),
+            character_store: Arc::new(InMemoryCharacterStore::new()),
+            validated_tx,
+            auth_result_rx,
+            enter_zone_tx,
+            snapshot_rx_source: snap_source_rx,
         };
 
         tokio::spawn(run_connection(server_r.into_inner(), server_w, config));
 
-        // Client sends a Handshake with an empty token.
+        // Client sends Handshake with an invalid (empty) token.
         let hs = ClientMessage::Handshake(Handshake { token: "".into() });
         let (h, p) = protocol::encode_client(&hs, 1).unwrap();
         write_tcp_message(&mut client_w, &h, &p).await.unwrap();
 
-        let (rh, rp) = read_tcp_message(&mut client_r).await.unwrap();
+        let (rh, rp) = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            read_tcp_message(&mut client_r),
+        )
+        .await
+        .expect("timed out waiting for HandshakeRejected")
+        .unwrap();
         let reply = protocol::decode_server(&rh, &rp).unwrap();
         assert!(
             matches!(
@@ -928,20 +1251,15 @@ mod tests {
         );
     }
 
-    // ── UdpDispatch test ─────────────────────────────────────────────────────
+    // ── UdpDispatch tests ────────────────────────────────────────────────────
 
     #[tokio::test]
     async fn udp_dispatch_sends_bytes_to_addr() {
-        // Bind a recv socket to a random port.
         let recv_socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let recv_addr = recv_socket.local_addr().unwrap();
-
-        // Bind the dispatch socket.
         let dispatch_socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
 
         let (udp_tx, udp_rx) = mpsc::channel::<UdpPacket>(8);
-
-        // Spawn the dispatch task.
         tokio::spawn(run_udp_dispatch(dispatch_socket, udp_rx));
 
         let payload = Bytes::from_static(b"hello udp dispatch");
@@ -950,7 +1268,6 @@ mod tests {
             .await
             .unwrap();
 
-        // Receive on the other end.
         let mut buf = [0u8; 128];
         let (n, _) = tokio::time::timeout(
             std::time::Duration::from_secs(2),
@@ -969,11 +1286,8 @@ mod tests {
         let (udp_tx, udp_rx) = mpsc::channel::<UdpPacket>(8);
 
         let task = tokio::spawn(run_udp_dispatch(socket, udp_rx));
-
-        // Drop the sender to close the channel.
         drop(udp_tx);
 
-        // Task should finish cleanly within a short timeout.
         tokio::time::timeout(std::time::Duration::from_secs(2), task)
             .await
             .expect("dispatch task did not exit after channel close")

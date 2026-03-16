@@ -15,19 +15,28 @@
 //!
 //! | Method | Path        | Description                                    |
 //! |--------|-------------|------------------------------------------------|
-//! | GET    | `/admin`    | Serves the self-contained HTML dashboard       |
-//! | GET    | `/admin/ws` | WebSocket; pushes JSON [`AdminSnapshot`] on every change |
+//! | GET    | `/admin`            | Serves the self-contained HTML dashboard       |
+//! | GET    | `/admin/ws`         | WebSocket; pushes JSON [`AdminSnapshot`] on every change |
+//! | GET    | `/admin/api/accounts` | JSON list of registered accounts (requires DB) |
 
 use axum::{
     extract::{ws, State, WebSocketUpgrade},
     http::{header, StatusCode},
     response::{IntoResponse, Response},
     routing::get,
-    Router,
+    Json, Router,
 };
 use common::AdminSnapshot;
+use serde::Serialize;
 use tokio::sync::watch;
 use tracing::{debug, error, info};
+
+/// Combined state for admin routes.
+#[derive(Clone)]
+pub struct AdminState {
+    pub snapshot_rx: watch::Receiver<AdminSnapshot>,
+    pub db_pool: Option<sqlx::PgPool>,
+}
 
 /// Embedded self-contained dashboard HTML.
 ///
@@ -40,18 +49,20 @@ static DASHBOARD_HTML: &str = include_str!("dashboard.html");
 
 /// Build an [`axum::Router`] that serves the admin dashboard.
 ///
-/// The router exposes two endpoints:
-/// - `GET /admin`    — the embedded HTML page.
-/// - `GET /admin/ws` — a WebSocket that pushes [`AdminSnapshot`] JSON
-///   to connected browsers on every change written to `snapshot_rx`.
+/// The router exposes:
+/// - `GET /admin`              — the embedded HTML page.
+/// - `GET /admin/ws`           — WebSocket pushing [`AdminSnapshot`] JSON on change.
+/// - `GET /admin/api/accounts` — JSON list of registered accounts (if DB is configured).
 ///
 /// The returned router can be merged into a larger application or served
 /// standalone via [`start_admin_server`].
-pub fn admin_router(snapshot_rx: watch::Receiver<AdminSnapshot>) -> Router {
+pub fn admin_router(snapshot_rx: watch::Receiver<AdminSnapshot>, db_pool: Option<sqlx::PgPool>) -> Router {
+    let state = AdminState { snapshot_rx, db_pool };
     Router::new()
         .route("/admin", get(dashboard_handler))
         .route("/admin/ws", get(ws_handler))
-        .with_state(snapshot_rx)
+        .route("/admin/api/accounts", get(accounts_handler))
+        .with_state(state)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -79,9 +90,9 @@ async fn dashboard_handler() -> Response {
 /// the client disconnects or the watch sender is dropped.
 pub async fn ws_handler(
     ws: WebSocketUpgrade,
-    State(rx): State<watch::Receiver<AdminSnapshot>>,
+    State(state): State<AdminState>,
 ) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_ws(socket, rx))
+    ws.on_upgrade(move |socket| handle_ws(socket, state.snapshot_rx))
 }
 
 async fn handle_ws(mut socket: ws::WebSocket, mut rx: watch::Receiver<AdminSnapshot>) {
@@ -137,6 +148,47 @@ async fn handle_ws(mut socket: ws::WebSocket, mut rx: watch::Receiver<AdminSnaps
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Accounts API handler
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[derive(Serialize)]
+struct AccountRow {
+    id: String,
+    username: String,
+    created_at: String,
+}
+
+/// GET /admin/api/accounts — return JSON list of registered accounts.
+///
+/// Returns 503 if no database is configured (dev mode without DATABASE_URL).
+async fn accounts_handler(
+    State(state): State<AdminState>,
+) -> Result<Json<Vec<AccountRow>>, StatusCode> {
+    let pool = state.db_pool.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+
+    let rows: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT id::text, username, to_char(created_at, 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') FROM accounts ORDER BY created_at DESC LIMIT 100",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|e| {
+        tracing::error!(error = %e, "failed to query accounts");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    let accounts = rows
+        .into_iter()
+        .map(|(id, username, created_at)| AccountRow {
+            id,
+            username,
+            created_at,
+        })
+        .collect();
+
+    Ok(Json(accounts))
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Server launcher
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -153,6 +205,7 @@ async fn handle_ws(mut socket: ws::WebSocket, mut rx: watch::Receiver<AdminSnaps
 pub async fn start_admin_server(
     port: u16,
     snapshot_rx: watch::Receiver<AdminSnapshot>,
+    db_pool: Option<sqlx::PgPool>,
 ) -> anyhow::Result<tokio::task::JoinHandle<()>> {
     let addr = format!("0.0.0.0:{port}");
     let listener = tokio::net::TcpListener::bind(&addr).await?;
@@ -162,7 +215,7 @@ pub async fn start_admin_server(
     println!("Admin dashboard: http://localhost:{port}/admin");
     info!("admin dashboard listening on http://0.0.0.0:{port}/admin");
 
-    let router = admin_router(snapshot_rx);
+    let router = admin_router(snapshot_rx, db_pool);
 
     let handle = tokio::spawn(async move {
         if let Err(e) = axum::serve(listener, router).await {
@@ -220,6 +273,7 @@ mod tests {
                     tick_duration_ms_max: 55.0,
                 },
             ],
+            entity_snapshots: Vec::new(),
         }
     }
 
@@ -230,7 +284,7 @@ mod tests {
     /// transport does not support WebSocket upgrades.
     fn build_real_server(snapshot: AdminSnapshot) -> (TestServer, watch::Sender<AdminSnapshot>) {
         let (tx, rx) = watch::channel(snapshot);
-        let router = admin_router(rx);
+        let router = admin_router(rx, None);
         let config = TestServerConfig::builder()
             .http_transport()
             .build();

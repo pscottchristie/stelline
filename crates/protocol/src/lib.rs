@@ -7,8 +7,28 @@
 //! - The `msg_type` u16 namespace is partitioned by build phase so future
 //!   additions never collide with existing constants.
 
-use common::{EntityId, EntityState, Vec2, Vec3, ZoneId};
+use common::{CharacterId, CharacterInfo, Class, EntityId, EntityState, Race, Vec2, Vec3, ZoneId};
 use serde::{Deserialize, Serialize};
+
+// ---------------------------------------------------------------------------
+// JWT claims (shared between login-server and gateway)
+// ---------------------------------------------------------------------------
+
+/// JWT claims issued by the login-server and validated by the gateway.
+///
+/// The `jti` (JWT ID) is checked against the Redis blocklist on connect to
+/// support immediate token revocation without waiting for expiry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuthClaims {
+    /// Account UUID (subject).
+    pub sub: String,
+    /// Unique token ID — stored in Redis to revoke a specific token.
+    pub jti: String,
+    /// Issued-at time (Unix seconds).
+    pub iat: usize,
+    /// Expiry time (Unix seconds).
+    pub exp: usize,
+}
 
 // ---------------------------------------------------------------------------
 // Error type
@@ -49,6 +69,18 @@ pub mod msg_type {
     pub const PONG: u16 = 0x0103;
     pub const WORLD_SNAPSHOT: u16 = 0x0104;
     pub const ZONE_TRANSFER: u16 = 0x0105;
+
+    // Client → Server (Phase 2 — Character selection)
+    pub const CHARACTER_LIST_REQUEST: u16 = 0x0200;
+    pub const CREATE_CHARACTER: u16 = 0x0201;
+    pub const DELETE_CHARACTER: u16 = 0x0202;
+    pub const SELECT_CHARACTER: u16 = 0x0203;
+
+    // Server → Client (Phase 2 — Character selection)
+    pub const CHARACTER_LIST: u16 = 0x0210;
+    pub const CHARACTER_CREATED: u16 = 0x0211;
+    pub const CHARACTER_DELETED: u16 = 0x0212;
+    pub const CHARACTER_CREATE_FAILED: u16 = 0x0213;
 }
 
 // ---------------------------------------------------------------------------
@@ -135,7 +167,7 @@ impl PacketHeader {
 /// The gateway validates the JWT; on success it admits the client into a zone.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Handshake {
-    /// JWT issued by the auth-server.
+    /// JWT issued by the login-server.
     pub token: String,
 }
 
@@ -161,6 +193,35 @@ pub struct MoveInput {
     pub speed: f32,
 }
 
+// ---------------------------------------------------------------------------
+// Client → Server messages (Phase 2 — Character selection)
+// ---------------------------------------------------------------------------
+
+/// Request the list of characters for the authenticated account.
+/// No payload — the account is identified from the validated JWT.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CharacterListRequest;
+
+/// Create a new character on the authenticated account.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CreateCharacter {
+    pub name: String,
+    pub race: Race,
+    pub class: Class,
+}
+
+/// Delete a character owned by the authenticated account.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DeleteCharacter {
+    pub character_id: CharacterId,
+}
+
+/// Select a character to enter the world with.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SelectCharacter {
+    pub character_id: CharacterId,
+}
+
 /// Top-level enum for all client-originated messages.
 ///
 /// The gateway pattern-matches on this to route each variant to the correct
@@ -172,6 +233,11 @@ pub enum ClientMessage {
     MoveInput(MoveInput),
     /// Client is gracefully disconnecting. No payload.
     Disconnect,
+    // Phase 2 — Character selection
+    CharacterListRequest(CharacterListRequest),
+    CreateCharacter(CreateCharacter),
+    DeleteCharacter(DeleteCharacter),
+    SelectCharacter(SelectCharacter),
 }
 
 // ---------------------------------------------------------------------------
@@ -197,6 +263,8 @@ pub enum RejectReason {
     ExpiredToken,
     /// The realm has reached its player capacity.
     ServerFull,
+    /// Another session with this account is already connected.
+    AlreadyConnected,
 }
 
 /// Sent when the gateway rejects the client's [`Handshake`].
@@ -245,6 +313,34 @@ pub struct ZoneTransfer {
     pub position: Vec3,
 }
 
+// ---------------------------------------------------------------------------
+// Server → Client messages (Phase 2 — Character selection)
+// ---------------------------------------------------------------------------
+
+/// Response to [`CharacterListRequest`] — the list of characters on the account.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CharacterList {
+    pub characters: Vec<CharacterInfo>,
+}
+
+/// Confirmation that a character was created successfully.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CharacterCreated {
+    pub character: CharacterInfo,
+}
+
+/// Confirmation that a character was deleted.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CharacterDeleted {
+    pub character_id: CharacterId,
+}
+
+/// A character creation request failed.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CharacterCreateFailed {
+    pub reason: String,
+}
+
 /// Top-level enum for all server-originated messages.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ServerMessage {
@@ -253,6 +349,11 @@ pub enum ServerMessage {
     Pong(Pong),
     WorldSnapshot(WorldSnapshot),
     ZoneTransfer(ZoneTransfer),
+    // Phase 2 — Character selection
+    CharacterList(CharacterList),
+    CharacterCreated(CharacterCreated),
+    CharacterDeleted(CharacterDeleted),
+    CharacterCreateFailed(CharacterCreateFailed),
 }
 
 // ---------------------------------------------------------------------------
@@ -266,6 +367,10 @@ fn client_msg_type(msg: &ClientMessage) -> u16 {
         ClientMessage::Ping(_) => msg_type::PING,
         ClientMessage::MoveInput(_) => msg_type::MOVE_INPUT,
         ClientMessage::Disconnect => msg_type::DISCONNECT,
+        ClientMessage::CharacterListRequest(_) => msg_type::CHARACTER_LIST_REQUEST,
+        ClientMessage::CreateCharacter(_) => msg_type::CREATE_CHARACTER,
+        ClientMessage::DeleteCharacter(_) => msg_type::DELETE_CHARACTER,
+        ClientMessage::SelectCharacter(_) => msg_type::SELECT_CHARACTER,
     }
 }
 
@@ -277,6 +382,10 @@ fn server_msg_type(msg: &ServerMessage) -> u16 {
         ServerMessage::Pong(_) => msg_type::PONG,
         ServerMessage::WorldSnapshot(_) => msg_type::WORLD_SNAPSHOT,
         ServerMessage::ZoneTransfer(_) => msg_type::ZONE_TRANSFER,
+        ServerMessage::CharacterList(_) => msg_type::CHARACTER_LIST,
+        ServerMessage::CharacterCreated(_) => msg_type::CHARACTER_CREATED,
+        ServerMessage::CharacterDeleted(_) => msg_type::CHARACTER_DELETED,
+        ServerMessage::CharacterCreateFailed(_) => msg_type::CHARACTER_CREATE_FAILED,
     }
 }
 
@@ -304,6 +413,10 @@ pub fn encode_client(
         ClientMessage::Ping(inner) => bincode::serialize(inner)?,
         ClientMessage::MoveInput(inner) => bincode::serialize(inner)?,
         ClientMessage::Disconnect => Vec::new(),
+        ClientMessage::CharacterListRequest(_) => Vec::new(),
+        ClientMessage::CreateCharacter(inner) => bincode::serialize(inner)?,
+        ClientMessage::DeleteCharacter(inner) => bincode::serialize(inner)?,
+        ClientMessage::SelectCharacter(inner) => bincode::serialize(inner)?,
     };
 
     let header = PacketHeader {
@@ -331,6 +444,10 @@ pub fn encode_server(
         ServerMessage::Pong(inner) => bincode::serialize(inner)?,
         ServerMessage::WorldSnapshot(inner) => bincode::serialize(inner)?,
         ServerMessage::ZoneTransfer(inner) => bincode::serialize(inner)?,
+        ServerMessage::CharacterList(inner) => bincode::serialize(inner)?,
+        ServerMessage::CharacterCreated(inner) => bincode::serialize(inner)?,
+        ServerMessage::CharacterDeleted(inner) => bincode::serialize(inner)?,
+        ServerMessage::CharacterCreateFailed(inner) => bincode::serialize(inner)?,
     };
 
     let header = PacketHeader {
@@ -368,6 +485,21 @@ pub fn decode_client(
             ClientMessage::MoveInput(inner)
         }
         msg_type::DISCONNECT => ClientMessage::Disconnect,
+        msg_type::CHARACTER_LIST_REQUEST => {
+            ClientMessage::CharacterListRequest(CharacterListRequest)
+        }
+        msg_type::CREATE_CHARACTER => {
+            let inner: CreateCharacter = bincode::deserialize(payload)?;
+            ClientMessage::CreateCharacter(inner)
+        }
+        msg_type::DELETE_CHARACTER => {
+            let inner: DeleteCharacter = bincode::deserialize(payload)?;
+            ClientMessage::DeleteCharacter(inner)
+        }
+        msg_type::SELECT_CHARACTER => {
+            let inner: SelectCharacter = bincode::deserialize(payload)?;
+            ClientMessage::SelectCharacter(inner)
+        }
         unknown => return Err(ProtocolError::UnknownMessageType(unknown)),
     };
     Ok(msg)
@@ -404,6 +536,22 @@ pub fn decode_server(
         msg_type::ZONE_TRANSFER => {
             let inner: ZoneTransfer = bincode::deserialize(payload)?;
             ServerMessage::ZoneTransfer(inner)
+        }
+        msg_type::CHARACTER_LIST => {
+            let inner: CharacterList = bincode::deserialize(payload)?;
+            ServerMessage::CharacterList(inner)
+        }
+        msg_type::CHARACTER_CREATED => {
+            let inner: CharacterCreated = bincode::deserialize(payload)?;
+            ServerMessage::CharacterCreated(inner)
+        }
+        msg_type::CHARACTER_DELETED => {
+            let inner: CharacterDeleted = bincode::deserialize(payload)?;
+            ServerMessage::CharacterDeleted(inner)
+        }
+        msg_type::CHARACTER_CREATE_FAILED => {
+            let inner: CharacterCreateFailed = bincode::deserialize(payload)?;
+            ServerMessage::CharacterCreateFailed(inner)
         }
         unknown => return Err(ProtocolError::UnknownMessageType(unknown)),
     };
@@ -971,12 +1119,131 @@ mod tests {
         }
     }
 
+    // -- Phase 2: Character selection message round-trips ----------------------
+
+    #[test]
+    fn client_character_list_request_roundtrip() {
+        let msg = ClientMessage::CharacterListRequest(CharacterListRequest);
+        assert_eq!(client_roundtrip(msg.clone()), msg);
+    }
+
+    #[test]
+    fn client_character_list_request_has_zero_payload() {
+        let (header, payload) =
+            encode_client(&ClientMessage::CharacterListRequest(CharacterListRequest), 0).unwrap();
+        assert_eq!(header.msg_type, msg_type::CHARACTER_LIST_REQUEST);
+        assert_eq!(header.payload_len, 0);
+        assert!(payload.is_empty());
+    }
+
+    #[test]
+    fn client_create_character_roundtrip() {
+        let msg = ClientMessage::CreateCharacter(CreateCharacter {
+            name: "Arthas".to_string(),
+            race: Race::Human,
+            class: Class::Warrior,
+        });
+        assert_eq!(client_roundtrip(msg.clone()), msg);
+    }
+
+    #[test]
+    fn client_create_character_msg_type_constant() {
+        let msg = ClientMessage::CreateCharacter(CreateCharacter {
+            name: "X".to_string(),
+            race: Race::Orc,
+            class: Class::Rogue,
+        });
+        let (header, _) = encode_client(&msg, 0).unwrap();
+        assert_eq!(header.msg_type, msg_type::CREATE_CHARACTER);
+    }
+
+    #[test]
+    fn client_delete_character_roundtrip() {
+        let msg = ClientMessage::DeleteCharacter(DeleteCharacter {
+            character_id: CharacterId::new("uuid-to-delete".to_string()),
+        });
+        assert_eq!(client_roundtrip(msg.clone()), msg);
+    }
+
+    #[test]
+    fn client_select_character_roundtrip() {
+        let msg = ClientMessage::SelectCharacter(SelectCharacter {
+            character_id: CharacterId::new("uuid-to-select".to_string()),
+        });
+        assert_eq!(client_roundtrip(msg.clone()), msg);
+    }
+
+    #[test]
+    fn server_character_list_empty_roundtrip() {
+        let msg = ServerMessage::CharacterList(CharacterList {
+            characters: vec![],
+        });
+        assert_eq!(server_roundtrip(msg.clone()), msg);
+    }
+
+    #[test]
+    fn server_character_list_with_entries_roundtrip() {
+        let msg = ServerMessage::CharacterList(CharacterList {
+            characters: vec![
+                CharacterInfo {
+                    id: CharacterId::new("c1".to_string()),
+                    name: "Arthas".to_string(),
+                    race: Race::Human,
+                    class: Class::Warrior,
+                    level: 60,
+                    zone_id: ZoneId::new(1),
+                },
+                CharacterInfo {
+                    id: CharacterId::new("c2".to_string()),
+                    name: "Jaina".to_string(),
+                    race: Race::Human,
+                    class: Class::Mage,
+                    level: 45,
+                    zone_id: ZoneId::new(2),
+                },
+            ],
+        });
+        assert_eq!(server_roundtrip(msg.clone()), msg);
+    }
+
+    #[test]
+    fn server_character_created_roundtrip() {
+        let msg = ServerMessage::CharacterCreated(CharacterCreated {
+            character: CharacterInfo {
+                id: CharacterId::new("new-uuid".to_string()),
+                name: "Thrall".to_string(),
+                race: Race::Orc,
+                class: Class::Warrior,
+                level: 1,
+                zone_id: ZoneId::new(1),
+            },
+        });
+        assert_eq!(server_roundtrip(msg.clone()), msg);
+    }
+
+    #[test]
+    fn server_character_deleted_roundtrip() {
+        let msg = ServerMessage::CharacterDeleted(CharacterDeleted {
+            character_id: CharacterId::new("deleted-uuid".to_string()),
+        });
+        assert_eq!(server_roundtrip(msg.clone()), msg);
+    }
+
+    #[test]
+    fn server_character_create_failed_roundtrip() {
+        let msg = ServerMessage::CharacterCreateFailed(CharacterCreateFailed {
+            reason: "Name already taken".to_string(),
+        });
+        assert_eq!(server_roundtrip(msg.clone()), msg);
+    }
+
     #[test]
     fn all_reject_reasons_roundtrip() {
         let reasons = [
             RejectReason::InvalidToken,
             RejectReason::ExpiredToken,
             RejectReason::ServerFull,
+            RejectReason::AlreadyConnected,
         ];
         for reason in reasons {
             let msg = ServerMessage::HandshakeRejected(HandshakeRejected { reason });
