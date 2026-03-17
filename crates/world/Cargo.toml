@@ -6,9 +6,11 @@ edition = "2021"
 [dependencies]
 common = { path = "../common" }
 protocol = { path = "../protocol" }
+game-data = { path = "../game-data" }
 hecs = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
+rand = { version = "0.8", features = ["small_rng"] }
 
 [dev-dependencies]
 tokio = { workspace = true }

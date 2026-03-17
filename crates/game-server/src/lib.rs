@@ -400,13 +400,17 @@ pub fn spawn_zone_threads(
     for zone_config in &world_config.zones {
         let zone_id = ZoneId::new(zone_config.id);
         let (inbox_tx, inbox_rx) = std_mpsc::sync_channel::<ZoneCommand>(256);
-        let zone = world::Zone::with_config(
+        let mut zone = world::Zone::with_config(
             zone_id,
             &zone_config.name,
             zone_config.aoi_radius,
             zone_config.width,
             zone_config.height,
         );
+
+        // Spawn initial creatures from config.
+        zone.spawn_initial_creatures(&world_config.creatures, &zone_config.spawns);
+
         let outbox_tx = zone_event_tx.clone();
 
         std::thread::Builder::new()

@@ -1,0 +1,112 @@
+# Stelline — World Configuration
+#
+# Creature definitions and zone spawn tables.
+# The game-server loads this file at startup (or falls back to built-in defaults).
+
+# ─── Creature Definitions ────────────────────────────────────────────────────
+
+[[creatures]]
+id = 1
+name = "Forest Wolf"
+level = 3
+max_health = 120
+move_speed = 5.0
+behavior = "Wander"
+is_npc = false
+
+[[creatures]]
+id = 2
+name = "Young Bear"
+level = 5
+max_health = 200
+move_speed = 4.0
+behavior = "Wander"
+is_npc = false
+
+[[creatures]]
+id = 3
+name = "Marshal Dughan"
+level = 25
+max_health = 2000
+move_speed = 0.0
+behavior = "Idle"
+is_npc = true
+
+# ─── Zones ───────────────────────────────────────────────────────────────────
+
+[[zones]]
+id = 1
+name = "Elwynn Forest"
+aoi_radius = 150.0
+width = 2000.0
+height = 2000.0
+
+[[zones.spawns]]
+creature_id = 1
+x = 200.0
+z = 300.0
+wander_radius = 40.0
+respawn_secs = 30.0
+
+[[zones.spawns]]
+creature_id = 1
+x = 400.0
+z = 500.0
+wander_radius = 35.0
+respawn_secs = 30.0
+
+[[zones.spawns]]
+creature_id = 1
+x = 150.0
+z = 600.0
+wander_radius = 30.0
+respawn_secs = 30.0
+
+[[zones.spawns]]
+creature_id = 2
+x = 600.0
+z = 200.0
+wander_radius = 50.0
+respawn_secs = 45.0
+
+[[zones.spawns]]
+creature_id = 2
+x = 300.0
+z = 700.0
+wander_radius = 45.0
+respawn_secs = 45.0
+
+[[zones.spawns]]
+creature_id = 2
+x = 800.0
+z = 400.0
+wander_radius = 40.0
+respawn_secs = 45.0
+
+[[zones.spawns]]
+creature_id = 3
+x = 100.0
+z = 100.0
+wander_radius = 0.0
+respawn_secs = 60.0
+
+[[zones]]
+id = 2
+name = "Stormwind City"
+aoi_radius = 100.0
+width = 500.0
+height = 500.0
+
+[[zones]]
+id = 3
+name = "Westfall"
+aoi_radius = 175.0
+width = 2200.0
+height = 2200.0
+
+[[zones]]
+id = 4
+name = "The Barrens"
+aoi_radius = 200.0
+width = 4000.0
+height = 4000.0

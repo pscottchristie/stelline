@@ -18,7 +18,10 @@ use std::sync::mpsc::{Receiver, SyncSender};
 use std::time::{Duration, Instant};
 
 use common::{EntityFlags, EntityId, EntityKind, EntityState, Vec2, Vec3, ZoneId};
+use game_data::{AiBehavior, CreatureDef, CreatureId};
 use protocol::WorldSnapshot;
+use rand::rngs::SmallRng;
+use rand::{Rng, SeedableRng};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // ECS Components
@@ -52,6 +55,50 @@ pub struct Player {
 /// Used by the admin world view canvas to display names next to entity dots.
 #[derive(Debug, Clone)]
 pub struct Label(pub String);
+
+/// Marker for any non-player entity (mob or NPC).
+#[derive(Debug, Clone, Copy)]
+pub struct Creature {
+    pub entity_id: EntityId,
+    pub kind: EntityKind,
+}
+
+/// AI state for a creature.
+#[derive(Debug, Clone)]
+pub struct Ai {
+    pub behavior: AiBehavior,
+    pub state: AiState,
+    pub spawn_pos: Vec3,
+    pub wander_radius: f32,
+    pub move_speed: f32,
+}
+
+/// Current AI state machine state.
+#[derive(Debug, Clone)]
+pub enum AiState {
+    /// Waiting for `remaining` seconds before picking a new action.
+    Idle { remaining: f32 },
+    /// Moving toward `target` position.
+    Walking { target: Vec3 },
+}
+
+/// Respawn metadata — stored at spawn time, used when creature dies.
+#[derive(Debug, Clone)]
+pub struct SpawnInfo {
+    pub creature_id: CreatureId,
+    pub spawn_pos: Vec3,
+    pub wander_radius: f32,
+    pub respawn_secs: f32,
+}
+
+/// A creature pending respawn after death.
+struct PendingRespawn {
+    creature_id: CreatureId,
+    spawn_pos: Vec3,
+    wander_radius: f32,
+    respawn_secs: f32,
+    timer: f32,
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // ZoneCommand — messages sent INTO a zone
@@ -295,6 +342,14 @@ pub struct Zone {
     width: f32,
     /// Zone playable area height in world units (for admin canvas scaling).
     height: f32,
+    /// Counter for allocating mob/NPC EntityIds. Partitioned: zone_id * 1_000_000.
+    next_mob_entity_id: u64,
+    /// Creatures waiting to respawn after death.
+    pending_respawns: Vec<PendingRespawn>,
+    /// Creature type definitions, indexed by CreatureId.
+    creature_defs: HashMap<CreatureId, CreatureDef>,
+    /// Per-zone RNG for AI decisions (deterministic, seedable).
+    rng: SmallRng,
 }
 
 impl Zone {
@@ -311,6 +366,10 @@ impl Zone {
             aoi_radius: DEFAULT_AOI_RADIUS,
             width: 1000.0,
             height: 1000.0,
+            next_mob_entity_id: id.get() as u64 * 1_000_000,
+            pending_respawns: Vec::new(),
+            creature_defs: HashMap::new(),
+            rng: SmallRng::seed_from_u64(id.get() as u64),
         }
     }
 
@@ -333,6 +392,10 @@ impl Zone {
             aoi_radius,
             width,
             height,
+            next_mob_entity_id: id.get() as u64 * 1_000_000,
+            pending_respawns: Vec::new(),
+            creature_defs: HashMap::new(),
+            rng: SmallRng::seed_from_u64(id.get() as u64),
         }
     }
 
@@ -417,6 +480,113 @@ impl Zone {
         self.connections.remove(&entity_id);
     }
 
+    // ── Creature spawning ──────────────────────────────────────────────────────
+
+    /// Spawn a single creature entity into the zone.
+    pub fn spawn_creature(
+        &mut self,
+        creature_def: &CreatureDef,
+        spawn_pos: Vec3,
+        wander_radius: f32,
+        respawn_secs: f32,
+    ) -> EntityId {
+        let entity_id = EntityId::new(self.next_mob_entity_id);
+        self.next_mob_entity_id += 1;
+
+        let kind = if creature_def.is_npc {
+            EntityKind::Npc
+        } else {
+            EntityKind::Mob
+        };
+
+        let ai_state = match creature_def.behavior {
+            AiBehavior::Idle => AiState::Idle { remaining: f32::MAX },
+            AiBehavior::Wander => AiState::Idle {
+                remaining: self.rng.gen_range(1.0..4.0),
+            },
+        };
+
+        let hecs_entity = self.world.spawn((
+            Position(spawn_pos),
+            Velocity(Vec2::ZERO),
+            Health {
+                current: creature_def.max_health,
+                max: creature_def.max_health,
+            },
+            Creature { entity_id, kind },
+            Ai {
+                behavior: creature_def.behavior,
+                state: ai_state,
+                spawn_pos,
+                wander_radius,
+                move_speed: creature_def.move_speed,
+            },
+            SpawnInfo {
+                creature_id: creature_def.id,
+                spawn_pos,
+                wander_radius,
+                respawn_secs,
+            },
+            Label(creature_def.name.clone()),
+        ));
+
+        self.entity_map.insert(entity_id, hecs_entity);
+        self.spatial_index.insert(entity_id, spawn_pos);
+
+        entity_id
+    }
+
+    /// Spawn all initial creatures from the config's creature defs and spawn points.
+    pub fn spawn_initial_creatures(
+        &mut self,
+        creatures: &[CreatureDef],
+        spawns: &[game_data::SpawnPoint],
+    ) {
+        for c in creatures {
+            self.creature_defs.insert(c.id, c.clone());
+        }
+
+        for sp in spawns {
+            if let Some(creature_def) = self.creature_defs.get(&sp.creature_id).cloned() {
+                let pos = Vec3::new(sp.x, 0.0, sp.z);
+                self.spawn_creature(&creature_def, pos, sp.wander_radius, sp.respawn_secs);
+            }
+        }
+    }
+
+    /// Kill a creature: remove from ECS, schedule respawn.
+    pub fn kill_creature(&mut self, entity_id: EntityId) {
+        if let Some(&hecs_entity) = self.entity_map.get(&entity_id) {
+            // Retrieve spawn info before despawning — clone to release borrow.
+            let spawn_info: Option<SpawnInfo> = self
+                .world
+                .get::<&SpawnInfo>(hecs_entity)
+                .ok()
+                .map(|si| SpawnInfo {
+                    creature_id: si.creature_id,
+                    spawn_pos: si.spawn_pos,
+                    wander_radius: si.wander_radius,
+                    respawn_secs: si.respawn_secs,
+                });
+
+            // Remove from all zone structures.
+            self.spatial_index.remove(entity_id);
+            self.entity_map.remove(&entity_id);
+            let _ = self.world.despawn(hecs_entity);
+
+            // Schedule respawn if we have spawn info.
+            if let Some(si) = spawn_info {
+                self.pending_respawns.push(PendingRespawn {
+                    creature_id: si.creature_id,
+                    spawn_pos: si.spawn_pos,
+                    wander_radius: si.wander_radius,
+                    respawn_secs: si.respawn_secs,
+                    timer: si.respawn_secs,
+                });
+            }
+        }
+    }
+
     /// Update the [`Velocity`] component for a player based on client input.
     /// Direction is normalised and speed is clamped to [`MAX_PLAYER_SPEED`].
     fn apply_move_input(&mut self, entity_id: EntityId, direction: Vec2, speed: f32) {
@@ -455,7 +625,13 @@ impl Zone {
         // Stage 1: integrate movement
         self.step_movement(DT);
 
-        // Stages 2-4 are no-ops in Phase 1 (AI, combat, timers)
+        // Stage 2: AI
+        self.step_ai(DT);
+
+        // Stage 3: combat (not yet implemented)
+
+        // Stage 4: timers (respawns)
+        self.step_timers(DT);
 
         // Stage 5: send snapshots to all connected players
         self.dispatch_snapshots();
@@ -480,22 +656,34 @@ impl Zone {
         // querying it.
         let mut updates: Vec<(EntityId, Vec3, Vec3)> = Vec::new(); // (id, old, new)
 
-        for (_, (pos, vel, player)) in self
+        // Move all entities that have Position + Velocity.
+        // Derive EntityId from either Player or Creature component.
+        for (hecs_entity, (pos, vel)) in self
             .world
-            .query::<(&Position, &Velocity, &Player)>()
+            .query::<(&Position, &Velocity)>()
             .iter()
         {
             let v = vel.0;
             if v.x == 0.0 && v.y == 0.0 {
                 continue; // stationary — skip
             }
+
+            // Resolve EntityId from Player or Creature marker.
+            let entity_id = if let Ok(p) = self.world.get::<&Player>(hecs_entity) {
+                p.entity_id
+            } else if let Ok(c) = self.world.get::<&Creature>(hecs_entity) {
+                c.entity_id
+            } else {
+                continue;
+            };
+
             let old_pos = pos.0;
             let new_pos = Vec3::new(
                 old_pos.x + v.x * dt,
-                old_pos.y, // Y is unchanged in Phase 1
+                old_pos.y,
                 old_pos.z + v.y * dt, // Vec2.y maps to world Z
             );
-            updates.push((player.entity_id, old_pos, new_pos));
+            updates.push((entity_id, old_pos, new_pos));
         }
 
         for (entity_id, old_pos, new_pos) in updates {
@@ -506,6 +694,164 @@ impl Zone {
                 *pos = Position(new_pos);
             }
             self.spatial_index.update(entity_id, old_pos, new_pos);
+        }
+    }
+
+    /// Run AI for all creatures with an [`Ai`] component.
+    fn step_ai(&mut self, dt: f32) {
+        // Collect AI decisions first, then apply them.
+        struct AiUpdate {
+            entity_id: EntityId,
+            new_velocity: Vec2,
+            new_state: AiState,
+        }
+
+        let mut updates: Vec<AiUpdate> = Vec::new();
+
+        for (_, (ai, creature)) in self.world.query::<(&Ai, &Creature)>().iter() {
+            let entity_id = creature.entity_id;
+
+            match &ai.state {
+                AiState::Idle { remaining } => {
+                    let new_remaining = remaining - dt;
+                    if new_remaining <= 0.0 && ai.behavior == AiBehavior::Wander && ai.wander_radius > 0.0 {
+                        // Will pick a new target — defer to after query ends.
+                        updates.push(AiUpdate {
+                            entity_id,
+                            new_velocity: Vec2::ZERO, // will be set when Walking starts
+                            new_state: AiState::Idle { remaining: -1.0 }, // sentinel: needs new target
+                        });
+                    } else {
+                        updates.push(AiUpdate {
+                            entity_id,
+                            new_velocity: Vec2::ZERO,
+                            new_state: AiState::Idle { remaining: new_remaining },
+                        });
+                    }
+                }
+                AiState::Walking { target } => {
+                    // Check if arrived.
+                    let hecs_entity = self.entity_map.get(&entity_id).copied();
+                    let current_pos = hecs_entity
+                        .and_then(|he| self.world.get::<&Position>(he).ok().map(|p| p.0))
+                        .unwrap_or(Vec3::ZERO);
+
+                    let dx = target.x - current_pos.x;
+                    let dz = target.z - current_pos.z;
+                    let dist = (dx * dx + dz * dz).sqrt();
+
+                    if dist < 1.0 {
+                        // Arrived — switch to Idle.
+                        updates.push(AiUpdate {
+                            entity_id,
+                            new_velocity: Vec2::ZERO,
+                            new_state: AiState::Idle { remaining: -2.0 }, // sentinel: needs random idle duration
+                        });
+                    } else {
+                        // Set velocity toward target.
+                        let dir_x = dx / dist;
+                        let dir_z = dz / dist;
+                        let speed = ai.move_speed;
+                        updates.push(AiUpdate {
+                            entity_id,
+                            new_velocity: Vec2::new(dir_x * speed, dir_z * speed),
+                            new_state: AiState::Walking { target: *target },
+                        });
+                    }
+                }
+            }
+        }
+
+        // Apply updates.
+        for update in updates {
+            let Some(&hecs_entity) = self.entity_map.get(&update.entity_id) else {
+                continue;
+            };
+
+            // Resolve sentinel states that need RNG.
+            let final_state = match update.new_state {
+                AiState::Idle { remaining } if remaining == -1.0 => {
+                    // Pick wander target.
+                    let ai = self.world.get::<&Ai>(hecs_entity).ok();
+                    let (spawn_pos, wander_radius, move_speed) = ai
+                        .map(|a| (a.spawn_pos, a.wander_radius, a.move_speed))
+                        .unwrap_or((Vec3::ZERO, 0.0, 0.0));
+
+                    let target = pick_wander_target(&mut self.rng, spawn_pos, wander_radius);
+                    // Set velocity toward target.
+                    let current_pos = self
+                        .world
+                        .get::<&Position>(hecs_entity)
+                        .map(|p| p.0)
+                        .unwrap_or(Vec3::ZERO);
+                    let dx = target.x - current_pos.x;
+                    let dz = target.z - current_pos.z;
+                    let dist = (dx * dx + dz * dz).sqrt();
+                    if dist > 0.1 {
+                        let vx = (dx / dist) * move_speed;
+                        let vz = (dz / dist) * move_speed;
+                        if let Ok(mut vel) = self.world.get::<&mut Velocity>(hecs_entity) {
+                            *vel = Velocity(Vec2::new(vx, vz));
+                        }
+                    }
+                    AiState::Walking { target }
+                }
+                AiState::Idle { remaining } if remaining == -2.0 => {
+                    // Random idle duration.
+                    AiState::Idle {
+                        remaining: self.rng.gen_range(2.0..8.0),
+                    }
+                }
+                other => other,
+            };
+
+            // Apply velocity (for non-sentinel Walking states where we set velocity in the update).
+            match &final_state {
+                AiState::Walking { .. } => {
+                    // Velocity was either set above (sentinel -1.0) or needs to be set here.
+                    if update.new_velocity.x != 0.0 || update.new_velocity.y != 0.0 {
+                        if let Ok(mut vel) = self.world.get::<&mut Velocity>(hecs_entity) {
+                            *vel = Velocity(update.new_velocity);
+                        }
+                    }
+                }
+                AiState::Idle { .. } => {
+                    if let Ok(mut vel) = self.world.get::<&mut Velocity>(hecs_entity) {
+                        *vel = Velocity(Vec2::ZERO);
+                    }
+                }
+            }
+
+            // Update AI state.
+            if let Ok(mut ai) = self.world.get::<&mut Ai>(hecs_entity) {
+                ai.state = final_state;
+            }
+        }
+    }
+
+    /// Tick respawn timers. Expired timers respawn the creature.
+    fn step_timers(&mut self, dt: f32) {
+        let mut to_respawn: Vec<PendingRespawn> = Vec::new();
+        self.pending_respawns.retain_mut(|pr| {
+            pr.timer -= dt;
+            if pr.timer <= 0.0 {
+                to_respawn.push(PendingRespawn {
+                    creature_id: pr.creature_id,
+                    spawn_pos: pr.spawn_pos,
+                    wander_radius: pr.wander_radius,
+                    respawn_secs: pr.respawn_secs,
+                    timer: 0.0,
+                });
+                false
+            } else {
+                true
+            }
+        });
+
+        for pr in to_respawn {
+            if let Some(creature_def) = self.creature_defs.get(&pr.creature_id).cloned() {
+                self.spawn_creature(&creature_def, pr.spawn_pos, pr.wander_radius, pr.respawn_secs);
+            }
         }
     }
 
@@ -551,8 +897,10 @@ impl Zone {
             // Determine entity kind from components.
             let kind = if self.world.get::<&Player>(candidate_hecs).is_ok() {
                 EntityKind::Player
+            } else if let Ok(c) = self.world.get::<&Creature>(candidate_hecs) {
+                c.kind
             } else {
-                EntityKind::Mob // Phase 1: all non-players are mobs
+                EntityKind::Mob // fallback
             };
 
             let (health, max_health) = self
@@ -652,27 +1000,24 @@ impl Zone {
             });
         }
 
-        // Non-player entities with Position but no Player component.
-        // Phase 1: no mobs/NPCs are spawned yet, but the query is ready.
-        for (hecs_entity, pos) in self.world.query::<&Position>().iter() {
-            // Skip entities already collected (players).
-            if self.world.get::<&Player>(hecs_entity).is_ok() {
-                continue;
-            }
-            // Determine entity_id from reverse map.
-            let entity_id = self
-                .entity_map
-                .iter()
-                .find(|(_, &he)| he == hecs_entity)
-                .map(|(&eid, _)| eid);
-            if let Some(entity_id) = entity_id {
-                entities.push(AdminEntity {
-                    entity_id,
-                    kind: EntityKind::Mob, // Phase 1: all non-players are mobs
-                    position: pos.0,
-                    label: String::new(),
-                });
-            }
+        // Creatures (mobs + NPCs) with Position + Creature.
+        for (hecs_entity, (pos, creature)) in self
+            .world
+            .query::<(&Position, &Creature)>()
+            .iter()
+        {
+            let label = self
+                .world
+                .get::<&Label>(hecs_entity)
+                .ok()
+                .map(|l| l.0.clone())
+                .unwrap_or_default();
+            entities.push(AdminEntity {
+                entity_id: creature.entity_id,
+                kind: creature.kind,
+                position: pos.0,
+                label,
+            });
         }
 
         let snapshot = ZoneEntitySnapshot {
@@ -706,6 +1051,17 @@ impl Zone {
 // ─────────────────────────────────────────────────────────────────────────────
 // Zone loop — entry point for the zone OS thread
 // ─────────────────────────────────────────────────────────────────────────────
+
+/// Pick a random point within `wander_radius` of `spawn_pos` in the XZ plane.
+fn pick_wander_target(rng: &mut SmallRng, spawn_pos: Vec3, wander_radius: f32) -> Vec3 {
+    let angle: f32 = rng.gen_range(0.0..std::f32::consts::TAU);
+    let dist: f32 = rng.gen_range(0.0..wander_radius);
+    Vec3::new(
+        spawn_pos.x + angle.cos() * dist,
+        spawn_pos.y,
+        spawn_pos.z + angle.sin() * dist,
+    )
+}
 
 /// The main loop executed by the zone's dedicated OS thread.
 ///
@@ -1484,5 +1840,256 @@ mod tests {
             "expected z≈2.5 after 5 ticks, got {}",
             pos.0.z
         );
+    }
+
+    // ── Creature spawn tests ─────────────────────────────────────────────────
+
+    fn wolf_def() -> CreatureDef {
+        CreatureDef {
+            id: 1,
+            name: "Forest Wolf".into(),
+            level: 3,
+            max_health: 120,
+            move_speed: 5.0,
+            behavior: AiBehavior::Wander,
+            is_npc: false,
+        }
+    }
+
+    fn npc_def() -> CreatureDef {
+        CreatureDef {
+            id: 3,
+            name: "Marshal Dughan".into(),
+            level: 25,
+            max_health: 2000,
+            move_speed: 0.0,
+            behavior: AiBehavior::Idle,
+            is_npc: true,
+        }
+    }
+
+    #[test]
+    fn spawn_creature_adds_to_world_and_spatial_index() {
+        let mut zone = make_zone();
+        let wolf = wolf_def();
+        let pos = Vec3::new(100.0, 0.0, 200.0);
+
+        let entity_id = zone.spawn_creature(&wolf, pos, 40.0, 30.0);
+
+        assert_eq!(zone.entity_count(), 1);
+        assert!(zone.entity_map.contains_key(&entity_id));
+
+        // Check spatial index.
+        let found = zone.spatial_index.query_radius(pos, 5.0);
+        assert!(found.contains(&entity_id));
+
+        // Check components.
+        let he = zone.entity_map[&entity_id];
+        let creature = zone.world.get::<&Creature>(he).unwrap();
+        assert_eq!(creature.kind, EntityKind::Mob);
+        let health = zone.world.get::<&Health>(he).unwrap();
+        assert_eq!(health.current, 120);
+        assert_eq!(health.max, 120);
+        let label = zone.world.get::<&Label>(he).unwrap();
+        assert_eq!(label.0, "Forest Wolf");
+    }
+
+    #[test]
+    fn spawn_creature_npc_has_correct_kind() {
+        let mut zone = make_zone();
+        let npc = npc_def();
+        let entity_id = zone.spawn_creature(&npc, Vec3::new(50.0, 0.0, 50.0), 0.0, 60.0);
+
+        let he = zone.entity_map[&entity_id];
+        let creature = zone.world.get::<&Creature>(he).unwrap();
+        assert_eq!(creature.kind, EntityKind::Npc);
+    }
+
+    #[test]
+    fn spawn_initial_creatures_populates_zone() {
+        let mut zone = make_zone();
+        let creatures = vec![wolf_def(), npc_def()];
+        let spawns = vec![
+            game_data::SpawnPoint { creature_id: 1, x: 100.0, z: 200.0, wander_radius: 40.0, respawn_secs: 30.0 },
+            game_data::SpawnPoint { creature_id: 1, x: 300.0, z: 400.0, wander_radius: 35.0, respawn_secs: 30.0 },
+            game_data::SpawnPoint { creature_id: 3, x: 50.0, z: 50.0, wander_radius: 0.0, respawn_secs: 60.0 },
+        ];
+
+        zone.spawn_initial_creatures(&creatures, &spawns);
+
+        assert_eq!(zone.entity_count(), 3);
+    }
+
+    #[test]
+    fn step_movement_moves_mobs() {
+        let mut zone = make_zone();
+        let wolf = wolf_def();
+        let pos = Vec3::new(100.0, 0.0, 100.0);
+        let entity_id = zone.spawn_creature(&wolf, pos, 40.0, 30.0);
+
+        // Manually set velocity on the creature.
+        let he = zone.entity_map[&entity_id];
+        {
+            let mut vel = zone.world.get::<&mut Velocity>(he).unwrap();
+            *vel = Velocity(Vec2::new(5.0, 0.0));
+        }
+
+        let (outbox_tx, _outbox_rx) = outbox_channel();
+        run_tick(&mut zone, &outbox_tx);
+
+        let new_pos = zone.world.get::<&Position>(he).unwrap().0;
+        // dt = 0.05, vel.x = 5.0 → Δx = 0.25
+        assert!(
+            (new_pos.x - 100.25).abs() < 1e-3,
+            "mob should have moved, got x={}",
+            new_pos.x
+        );
+    }
+
+    #[test]
+    fn step_ai_wander_mob_eventually_moves() {
+        let mut zone = make_zone();
+        let wolf = wolf_def();
+        let pos = Vec3::new(500.0, 0.0, 500.0);
+        let entity_id = zone.spawn_creature(&wolf, pos, 40.0, 30.0);
+
+        let (outbox_tx, _outbox_rx) = outbox_channel();
+
+        // Run many ticks — the mob should eventually start moving.
+        for _ in 0..200 {
+            run_tick(&mut zone, &outbox_tx);
+        }
+
+        let he = zone.entity_map[&entity_id];
+        let final_pos = zone.world.get::<&Position>(he).unwrap().0;
+
+        // After 200 ticks (10 sec at 20Hz), a wander mob should have moved from spawn.
+        let dist = pos.distance_xz(final_pos);
+        assert!(
+            dist > 0.1,
+            "wander mob should have moved after 200 ticks, distance from spawn = {}",
+            dist
+        );
+    }
+
+    #[test]
+    fn step_ai_wander_mob_stays_within_radius() {
+        let mut zone = make_zone();
+        let wolf = wolf_def();
+        let spawn_pos = Vec3::new(500.0, 0.0, 500.0);
+        let entity_id = zone.spawn_creature(&wolf, spawn_pos, 40.0, 30.0);
+
+        let (outbox_tx, _outbox_rx) = outbox_channel();
+
+        // Run many ticks.
+        for _ in 0..400 {
+            run_tick(&mut zone, &outbox_tx);
+        }
+
+        let he = zone.entity_map[&entity_id];
+        let final_pos = zone.world.get::<&Position>(he).unwrap().0;
+
+        // Wander target is picked within radius, but movement overshoot is possible.
+        // Allow generous margin (2x wander_radius).
+        let dist = spawn_pos.distance_xz(final_pos);
+        assert!(
+            dist < 80.0 + 10.0, // wander_radius * 2 + margin
+            "mob should roughly stay near spawn, distance = {}",
+            dist
+        );
+    }
+
+    #[test]
+    fn step_ai_idle_npc_does_not_move() {
+        let mut zone = make_zone();
+        let npc = npc_def();
+        let pos = Vec3::new(100.0, 0.0, 100.0);
+        let entity_id = zone.spawn_creature(&npc, pos, 0.0, 60.0);
+
+        let (outbox_tx, _outbox_rx) = outbox_channel();
+
+        for _ in 0..100 {
+            run_tick(&mut zone, &outbox_tx);
+        }
+
+        let he = zone.entity_map[&entity_id];
+        let final_pos = zone.world.get::<&Position>(he).unwrap().0;
+        assert_eq!(final_pos, pos, "idle NPC should not move");
+    }
+
+    #[test]
+    fn kill_creature_removes_and_schedules_respawn() {
+        let mut zone = make_zone();
+        let wolf = wolf_def();
+        let pos = Vec3::new(100.0, 0.0, 100.0);
+        let entity_id = zone.spawn_creature(&wolf, pos, 40.0, 5.0);
+
+        assert_eq!(zone.entity_count(), 1);
+
+        zone.kill_creature(entity_id);
+
+        assert_eq!(zone.entity_count(), 0);
+        assert!(!zone.entity_map.contains_key(&entity_id));
+        assert_eq!(zone.pending_respawns.len(), 1);
+        assert_eq!(zone.pending_respawns[0].creature_id, 1);
+    }
+
+    #[test]
+    fn step_timers_respawns_creature_after_timer_expires() {
+        let mut zone = make_zone();
+        let wolf = wolf_def();
+        zone.creature_defs.insert(wolf.id, wolf.clone());
+        let pos = Vec3::new(100.0, 0.0, 100.0);
+        let entity_id = zone.spawn_creature(&wolf, pos, 40.0, 1.0); // 1 sec respawn
+
+        zone.kill_creature(entity_id);
+        assert_eq!(zone.entity_count(), 0);
+
+        let (outbox_tx, _outbox_rx) = outbox_channel();
+
+        // Run enough ticks for the 1-second respawn timer to expire.
+        // At 20 Hz, 1 second = 20 ticks.
+        for _ in 0..25 {
+            run_tick(&mut zone, &outbox_tx);
+        }
+
+        assert_eq!(zone.entity_count(), 1, "creature should have respawned");
+        assert!(zone.pending_respawns.is_empty(), "respawn queue should be drained");
+    }
+
+    #[test]
+    fn build_snapshot_includes_creatures_with_correct_kind() {
+        let mut zone = make_zone();
+
+        // Add a player so we can build a snapshot.
+        let (tx, rx) = snapshot_channel();
+        let player_id = EntityId::new(1);
+        zone.apply(ZoneCommand::PlayerEnter {
+            entity_id: player_id,
+            position: Vec3::new(100.0, 0.0, 100.0),
+            snapshot_tx: tx,
+            label: "TestPlayer".into(),
+        });
+
+        // Spawn a wolf (mob) and NPC near the player.
+        let wolf = wolf_def();
+        let npc = npc_def();
+        zone.spawn_creature(&wolf, Vec3::new(105.0, 0.0, 100.0), 40.0, 30.0);
+        zone.spawn_creature(&npc, Vec3::new(110.0, 0.0, 100.0), 0.0, 60.0);
+
+        let (outbox_tx, _outbox_rx) = outbox_channel();
+        run_tick(&mut zone, &outbox_tx);
+
+        let snapshot = rx.try_recv().unwrap();
+        assert_eq!(snapshot.entities.len(), 3, "player + wolf + npc");
+
+        let mob = snapshot.entities.iter().find(|e| e.kind == EntityKind::Mob).unwrap();
+        assert_eq!(mob.name.as_deref(), Some("Forest Wolf"));
+
+        let npc_e = snapshot.entities.iter().find(|e| e.kind == EntityKind::Npc).unwrap();
+        assert_eq!(npc_e.name.as_deref(), Some("Marshal Dughan"));
+
+        let player = snapshot.entities.iter().find(|e| e.kind == EntityKind::Player).unwrap();
+        assert_eq!(player.name.as_deref(), Some("TestPlayer"));
     }
 }

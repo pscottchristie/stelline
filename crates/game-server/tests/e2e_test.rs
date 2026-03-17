@@ -137,12 +137,14 @@ async fn start_minimal_server_with_auth(
     Arc<dyn CharacterStore>,
 ) {
     let world_config = game_data::WorldConfig {
+        creatures: vec![],
         zones: vec![game_data::ZoneConfig {
             id: 1,
             name: "Test Zone".to_string(),
             aoi_radius: 150.0,
             width: 1000.0,
             height: 1000.0,
+            spawns: vec![],
         }],
     };
 
@@ -263,12 +265,14 @@ async fn test_admin_dashboard_reachable() {
 #[tokio::test]
 async fn test_zone_telemetry_reaches_admin_watch() {
     let world_config = game_data::WorldConfig {
+        creatures: vec![],
         zones: vec![game_data::ZoneConfig {
             id: 1,
             name: "Telemetry Zone".to_string(),
             aoi_radius: 150.0,
             width: 1000.0,
             height: 1000.0,
+            spawns: vec![],
         }],
     };
 

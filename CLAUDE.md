@@ -416,19 +416,25 @@ pub trait CharacterRepository: Send + Sync {
 - [x] `dotenvy` for `.env` file loading (no manual env var exports needed)
 
 ### Phase 3 — World
-- [ ] WorldCoordinator: zone transfer logic, service feedback routing, telemetry aggregation
-- [ ] Spatial index (grid) per zone + AOI snapshot dispatch to connection tasks
-- [ ] Zone configuration: load all zones from config at startup
-- [ ] `game-data`: zone/map data loading
+- [x] Creature definitions (CreatureDef) + spawn tables (SpawnPoint) in `game-data`
+- [x] Creature/Ai/SpawnInfo ECS components in `world`
+- [x] Creature spawning: spawn_creature, spawn_initial_creatures
+- [x] AI tick stage: wander behavior (random walk within radius), idle NPCs
+- [x] Respawn infrastructure: kill_creature → PendingRespawn → step_timers → respawn
+- [x] Movement for all entities (not just players)
+- [x] build_snapshot: correct EntityKind for Mob vs Npc, names in snapshots
+- [x] Zone configuration with creature data wired in game-server
+- [x] TOML config file (`data/world.toml`) with creatures and spawn points
+- [x] Validation: duplicate creature IDs, unknown refs, invalid values
+- Note: single-zone for now, multi-zone with cross-zone protocol deferred
 
 ### Phase 4 — Combat & AI
 - [ ] Spell system: data, casting pipeline, interrupts, cooldowns
 - [ ] Aura system: buffs/debuffs, stacking, duration
 - [ ] Combat formulas: hit/miss/crit/dodge/parry
 - [ ] Threat system: per-mob aggro tables
-- [ ] NPC AI: state machines
+- [ ] NPC AI: advanced state machines (patrol, combat)
 - [ ] Pathfinding: navmesh integration
-- [ ] Creature spawning: spawn tables, respawn timers
 
 ### Phase 5 — Game Systems
 - [ ] `services`: ChatService, AuctionService, MailService

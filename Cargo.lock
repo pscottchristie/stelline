@@ -9060,8 +9060,10 @@ name = "world"
 version = "0.1.0"
 dependencies = [
  "common",
+ "game-data",
  "hecs",
  "protocol",
+ "rand 0.8.5",
  "thiserror 1.0.69",
  "tokio",
  "tokio-test",
