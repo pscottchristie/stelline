@@ -6,7 +6,7 @@ use ratatui::widgets::canvas::{Canvas, Context, Line as CanvasLine, Points};
 use crate::app::ClientApp;
 
 /// View radius in world units. Smaller = more zoomed in = smoother apparent movement.
-const VIEW_RADIUS: f64 = 30.0;
+const VIEW_RADIUS: f64 = 80.0;
 
 /// Size of the crosshair arms at the origin (world units).
 const CROSSHAIR_SIZE: f64 = 1.5;

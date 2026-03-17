@@ -234,11 +234,16 @@ pub fn default_world_config() -> WorldConfig {
                 width: 2000.0,
                 height: 2000.0,
                 spawns: vec![
+                    // Near spawn (origin) — visible to new players immediately
+                    SpawnPoint { creature_id: 1, x: 30.0, z: 40.0, wander_radius: 25.0, respawn_secs: 30.0 },
+                    SpawnPoint { creature_id: 1, x: -20.0, z: 60.0, wander_radius: 20.0, respawn_secs: 30.0 },
+                    SpawnPoint { creature_id: 2, x: 50.0, z: -30.0, wander_radius: 30.0, respawn_secs: 45.0 },
+                    SpawnPoint { creature_id: 3, x: 15.0, z: 10.0, wander_radius: 0.0, respawn_secs: 60.0 },
+                    // Further out
                     SpawnPoint { creature_id: 1, x: 200.0, z: 300.0, wander_radius: 40.0, respawn_secs: 30.0 },
                     SpawnPoint { creature_id: 1, x: 400.0, z: 500.0, wander_radius: 35.0, respawn_secs: 30.0 },
                     SpawnPoint { creature_id: 2, x: 600.0, z: 200.0, wander_radius: 50.0, respawn_secs: 45.0 },
                     SpawnPoint { creature_id: 2, x: 300.0, z: 700.0, wander_radius: 45.0, respawn_secs: 45.0 },
-                    SpawnPoint { creature_id: 3, x: 100.0, z: 100.0, wander_radius: 0.0, respawn_secs: 60.0 },
                 ],
             },
             ZoneConfig {
