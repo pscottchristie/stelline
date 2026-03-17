@@ -11,6 +11,8 @@ members = [
     "crates/game-server",
     "crates/test-client",
     "crates/tui-client",
+    "crates/db-viewer",
+    "crates/cli",
 ]
 resolver = "2"
 

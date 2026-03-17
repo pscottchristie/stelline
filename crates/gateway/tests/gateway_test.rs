@@ -54,6 +54,7 @@ fn make_entity(seed: u64) -> EntityState {
         100 - (seed % 100) as u32,
         100,
         flags,
+        None,
     )
 }
 

@@ -652,6 +652,7 @@ mod tests {
                 100,
                 100,
                 EntityFlags::empty(),
+                None,
             )],
         }));
         assert_eq!(app.my_position, Vec3::new(10.0, 0.0, 20.0));

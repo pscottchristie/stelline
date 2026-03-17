@@ -78,8 +78,25 @@ pub fn render(frame: &mut Frame, area: Rect, app: &ClientApp) {
         bucket.extend_from_slice(&pts);
     }
 
-    // Player label — only for self entity, shown on the map
+    // Player label — for self entity, shown on the map
     let player_label: Option<String> = app.default_name.clone();
+
+    // Collect nearby player names + positions for map labels
+    let nearby_labels: Vec<(f64, f64, String, Color)> = app
+        .entities
+        .iter()
+        .filter_map(|entity| {
+            let is_self = app.entity_id == Some(entity.entity_id);
+            if is_self {
+                return None; // self label handled separately
+            }
+            let name = entity.name.as_deref()?;
+            let ex = entity.position.x as f64;
+            let ey = entity.position.z as f64;
+            let color = entity_color(entity.kind, false);
+            Some((ex, ey, name.to_string(), color))
+        })
+        .collect();
 
     let canvas = Canvas::default()
         .block(block)
@@ -132,6 +149,15 @@ pub fn render(frame: &mut Frame, area: Rect, app: &ClientApp) {
                         name.clone(),
                         Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
                     ),
+                );
+            }
+
+            // Layer 4: Nearby entity name labels
+            for (ex, ey, ref name, color) in &nearby_labels {
+                ctx.print(
+                    ex + LABEL_OFFSET_X,
+                    ey + LABEL_OFFSET_Y,
+                    Span::styled(name.clone(), Style::default().fg(*color)),
                 );
             }
         });

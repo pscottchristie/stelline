@@ -569,6 +569,13 @@ impl Zone {
                 }
             }
 
+            // Get the entity's label (character name for players, mob name, etc.)
+            let name = self
+                .world
+                .get::<&Label>(candidate_hecs)
+                .ok()
+                .map(|l| l.0.clone());
+
             entities.push(EntityState::new(
                 candidate_id,
                 kind,
@@ -577,6 +584,7 @@ impl Zone {
                 health,
                 max_health,
                 flags,
+                name,
             ));
         }
 

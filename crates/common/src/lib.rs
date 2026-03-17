@@ -353,6 +353,9 @@ pub struct EntityState {
     pub max_health: u32,
     /// Boolean state flags (in_combat, moving, casting, dead, …).
     pub flags: EntityFlags,
+    /// Character name for players, mob/NPC name for creatures.
+    /// `None` when the entity has no label (e.g. game objects).
+    pub name: Option<String>,
 }
 
 impl EntityState {
@@ -365,6 +368,7 @@ impl EntityState {
         health: u32,
         max_health: u32,
         flags: EntityFlags,
+        name: Option<String>,
     ) -> Self {
         Self {
             entity_id,
@@ -374,6 +378,7 @@ impl EntityState {
             health,
             max_health,
             flags,
+            name,
         }
     }
 }
@@ -900,6 +905,7 @@ mod tests {
             850,
             1000,
             flags,
+            None,
         );
 
         assert_eq!(state.entity_id, EntityId::new(1));
@@ -922,6 +928,7 @@ mod tests {
             200,
             200,
             EntityFlags::empty(),
+            None,
         );
         assert_eq!(state.kind, EntityKind::Mob);
         assert_eq!(state.health, 200);
@@ -938,6 +945,7 @@ mod tests {
             1,
             1,
             EntityFlags::empty(),
+            None,
         );
         let go = EntityState::new(
             EntityId::new(11),
@@ -947,6 +955,7 @@ mod tests {
             0,
             0,
             EntityFlags::empty(),
+            None,
         );
         assert_eq!(npc.kind, EntityKind::Npc);
         assert_eq!(go.kind, EntityKind::GameObject);
@@ -962,6 +971,7 @@ mod tests {
             50,
             50,
             EntityFlags::empty(),
+            None,
         );
         assert_eq!(state, state.clone());
     }
@@ -1234,6 +1244,7 @@ mod tests {
             0,
             0,
             flags,
+            None,
         );
         let json = serde_json::to_string(&original).expect("serialization failed");
         let restored: EntityState =

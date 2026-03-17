@@ -21,7 +21,15 @@ pub fn render(frame: &mut Frame, area: Rect, app: &ClientApp) {
         .map(|e| {
             let is_self = app.entity_id == Some(e.entity_id);
             let symbol = ClientApp::entity_symbol(e.kind, is_self).to_string();
-            let label = ClientApp::entity_label(e.kind, is_self);
+            let label = if let Some(ref name) = e.name {
+                if is_self {
+                    format!("{} (You)", name)
+                } else {
+                    name.clone()
+                }
+            } else {
+                ClientApp::entity_label(e.kind, is_self).to_string()
+            };
             let hp = format!("{}/{}", e.health, e.max_health);
             let dist = if is_self {
                 "---".to_string()

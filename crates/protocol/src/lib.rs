@@ -580,6 +580,7 @@ mod tests {
             100 + seed as u32,
             200,
             flags,
+            None,
         )
     }
 
@@ -901,6 +902,7 @@ mod tests {
             42,
             1000,
             flags,
+            None,
         );
         let msg = ServerMessage::WorldSnapshot(WorldSnapshot {
             tick: 7,
@@ -1077,6 +1079,7 @@ mod tests {
             0,
             100,
             flags,
+            None,
         );
         let msg = ServerMessage::WorldSnapshot(WorldSnapshot {
             tick: 1,
@@ -1106,6 +1109,7 @@ mod tests {
                 1,
                 1,
                 EntityFlags::empty(),
+                None,
             );
             let msg = ServerMessage::WorldSnapshot(WorldSnapshot {
                 tick: 0,

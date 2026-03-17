@@ -899,6 +899,7 @@ mod tests {
             100,
             100,
             EntityFlags::empty(),
+            None,
         )
     }
 
