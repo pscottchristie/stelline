@@ -2,7 +2,7 @@
 //!
 //! # Design
 //! - All messages are framed with a fixed 11-byte [`PacketHeader`].
-//! - Payloads are serialized with [`bincode`] (compact, little-endian).
+//! - Payloads are serialized with MessagePack via `rmp_serde` (named format, cross-language friendly).
 //! - TCP carries control messages; UDP carries [`ServerMessage::WorldSnapshot`].
 //! - The `msg_type` u16 namespace is partitioned by build phase so future
 //!   additions never collide with existing constants.
@@ -40,7 +40,7 @@ pub enum ProtocolError {
     UnknownMessageType(u16),
 
     #[error("serialization error: {0}")]
-    Serialization(#[from] Box<bincode::ErrorKind>),
+    Serialization(String),
 
     #[error("header too short")]
     HeaderTooShort,
@@ -357,6 +357,18 @@ pub enum ServerMessage {
 }
 
 // ---------------------------------------------------------------------------
+// Serialization helpers (MessagePack via rmp-serde)
+// ---------------------------------------------------------------------------
+
+fn serialize<T: serde::Serialize>(value: &T) -> Result<Vec<u8>, ProtocolError> {
+    rmp_serde::to_vec_named(value).map_err(|e| ProtocolError::Serialization(e.to_string()))
+}
+
+fn deserialize<'a, T: serde::Deserialize<'a>>(bytes: &'a [u8]) -> Result<T, ProtocolError> {
+    rmp_serde::from_slice(bytes).map_err(|e| ProtocolError::Serialization(e.to_string()))
+}
+
+// ---------------------------------------------------------------------------
 // Encode helpers
 // ---------------------------------------------------------------------------
 
@@ -400,8 +412,8 @@ fn server_msg_type(msg: &ServerMessage) -> u16 {
 /// counter; it is echoed into the header for the receiver to use.
 ///
 /// # Errors
-/// Returns [`ProtocolError::Serialization`] if bincode fails to serialize the
-/// payload. This should never happen for well-formed message types.
+/// Returns [`ProtocolError::Serialization`] if serialization fails.
+/// This should never happen for well-formed message types.
 pub fn encode_client(
     msg: &ClientMessage,
     sequence: u32,
@@ -409,14 +421,14 @@ pub fn encode_client(
     // Serialize only the inner struct, not the outer enum discriminant.
     // The msg_type field in the header carries the discriminant on the wire.
     let payload: Vec<u8> = match msg {
-        ClientMessage::Handshake(inner) => bincode::serialize(inner)?,
-        ClientMessage::Ping(inner) => bincode::serialize(inner)?,
-        ClientMessage::MoveInput(inner) => bincode::serialize(inner)?,
+        ClientMessage::Handshake(inner) => serialize(inner)?,
+        ClientMessage::Ping(inner) => serialize(inner)?,
+        ClientMessage::MoveInput(inner) => serialize(inner)?,
         ClientMessage::Disconnect => Vec::new(),
         ClientMessage::CharacterListRequest(_) => Vec::new(),
-        ClientMessage::CreateCharacter(inner) => bincode::serialize(inner)?,
-        ClientMessage::DeleteCharacter(inner) => bincode::serialize(inner)?,
-        ClientMessage::SelectCharacter(inner) => bincode::serialize(inner)?,
+        ClientMessage::CreateCharacter(inner) => serialize(inner)?,
+        ClientMessage::DeleteCharacter(inner) => serialize(inner)?,
+        ClientMessage::SelectCharacter(inner) => serialize(inner)?,
     };
 
     let header = PacketHeader {
@@ -439,15 +451,15 @@ pub fn encode_server(
     // Serialize only the inner struct, not the outer enum discriminant.
     // The msg_type field in the header carries the discriminant on the wire.
     let payload = match msg {
-        ServerMessage::HandshakeAccepted(inner) => bincode::serialize(inner)?,
-        ServerMessage::HandshakeRejected(inner) => bincode::serialize(inner)?,
-        ServerMessage::Pong(inner) => bincode::serialize(inner)?,
-        ServerMessage::WorldSnapshot(inner) => bincode::serialize(inner)?,
-        ServerMessage::ZoneTransfer(inner) => bincode::serialize(inner)?,
-        ServerMessage::CharacterList(inner) => bincode::serialize(inner)?,
-        ServerMessage::CharacterCreated(inner) => bincode::serialize(inner)?,
-        ServerMessage::CharacterDeleted(inner) => bincode::serialize(inner)?,
-        ServerMessage::CharacterCreateFailed(inner) => bincode::serialize(inner)?,
+        ServerMessage::HandshakeAccepted(inner) => serialize(inner)?,
+        ServerMessage::HandshakeRejected(inner) => serialize(inner)?,
+        ServerMessage::Pong(inner) => serialize(inner)?,
+        ServerMessage::WorldSnapshot(inner) => serialize(inner)?,
+        ServerMessage::ZoneTransfer(inner) => serialize(inner)?,
+        ServerMessage::CharacterList(inner) => serialize(inner)?,
+        ServerMessage::CharacterCreated(inner) => serialize(inner)?,
+        ServerMessage::CharacterDeleted(inner) => serialize(inner)?,
+        ServerMessage::CharacterCreateFailed(inner) => serialize(inner)?,
     };
 
     let header = PacketHeader {
@@ -466,22 +478,22 @@ pub fn encode_server(
 /// # Errors
 /// - [`ProtocolError::UnknownMessageType`] if `header.msg_type` is not a
 ///   recognised client message type.
-/// - [`ProtocolError::Serialization`] if bincode fails to deserialize the payload.
+/// - [`ProtocolError::Serialization`] if deserialization fails.
 pub fn decode_client(
     header: &PacketHeader,
     payload: &[u8],
 ) -> Result<ClientMessage, ProtocolError> {
     let msg = match header.msg_type {
         msg_type::HANDSHAKE => {
-            let inner: Handshake = bincode::deserialize(payload)?;
+            let inner: Handshake = deserialize(payload)?;
             ClientMessage::Handshake(inner)
         }
         msg_type::PING => {
-            let inner: Ping = bincode::deserialize(payload)?;
+            let inner: Ping = deserialize(payload)?;
             ClientMessage::Ping(inner)
         }
         msg_type::MOVE_INPUT => {
-            let inner: MoveInput = bincode::deserialize(payload)?;
+            let inner: MoveInput = deserialize(payload)?;
             ClientMessage::MoveInput(inner)
         }
         msg_type::DISCONNECT => ClientMessage::Disconnect,
@@ -489,15 +501,15 @@ pub fn decode_client(
             ClientMessage::CharacterListRequest(CharacterListRequest)
         }
         msg_type::CREATE_CHARACTER => {
-            let inner: CreateCharacter = bincode::deserialize(payload)?;
+            let inner: CreateCharacter = deserialize(payload)?;
             ClientMessage::CreateCharacter(inner)
         }
         msg_type::DELETE_CHARACTER => {
-            let inner: DeleteCharacter = bincode::deserialize(payload)?;
+            let inner: DeleteCharacter = deserialize(payload)?;
             ClientMessage::DeleteCharacter(inner)
         }
         msg_type::SELECT_CHARACTER => {
-            let inner: SelectCharacter = bincode::deserialize(payload)?;
+            let inner: SelectCharacter = deserialize(payload)?;
             ClientMessage::SelectCharacter(inner)
         }
         unknown => return Err(ProtocolError::UnknownMessageType(unknown)),
@@ -511,46 +523,46 @@ pub fn decode_client(
 /// # Errors
 /// - [`ProtocolError::UnknownMessageType`] if `header.msg_type` is not a
 ///   recognised server message type.
-/// - [`ProtocolError::Serialization`] if bincode fails to deserialize the payload.
+/// - [`ProtocolError::Serialization`] if deserialization fails.
 pub fn decode_server(
     header: &PacketHeader,
     payload: &[u8],
 ) -> Result<ServerMessage, ProtocolError> {
     let msg = match header.msg_type {
         msg_type::HANDSHAKE_ACCEPTED => {
-            let inner: HandshakeAccepted = bincode::deserialize(payload)?;
+            let inner: HandshakeAccepted = deserialize(payload)?;
             ServerMessage::HandshakeAccepted(inner)
         }
         msg_type::HANDSHAKE_REJECTED => {
-            let inner: HandshakeRejected = bincode::deserialize(payload)?;
+            let inner: HandshakeRejected = deserialize(payload)?;
             ServerMessage::HandshakeRejected(inner)
         }
         msg_type::PONG => {
-            let inner: Pong = bincode::deserialize(payload)?;
+            let inner: Pong = deserialize(payload)?;
             ServerMessage::Pong(inner)
         }
         msg_type::WORLD_SNAPSHOT => {
-            let inner: WorldSnapshot = bincode::deserialize(payload)?;
+            let inner: WorldSnapshot = deserialize(payload)?;
             ServerMessage::WorldSnapshot(inner)
         }
         msg_type::ZONE_TRANSFER => {
-            let inner: ZoneTransfer = bincode::deserialize(payload)?;
+            let inner: ZoneTransfer = deserialize(payload)?;
             ServerMessage::ZoneTransfer(inner)
         }
         msg_type::CHARACTER_LIST => {
-            let inner: CharacterList = bincode::deserialize(payload)?;
+            let inner: CharacterList = deserialize(payload)?;
             ServerMessage::CharacterList(inner)
         }
         msg_type::CHARACTER_CREATED => {
-            let inner: CharacterCreated = bincode::deserialize(payload)?;
+            let inner: CharacterCreated = deserialize(payload)?;
             ServerMessage::CharacterCreated(inner)
         }
         msg_type::CHARACTER_DELETED => {
-            let inner: CharacterDeleted = bincode::deserialize(payload)?;
+            let inner: CharacterDeleted = deserialize(payload)?;
             ServerMessage::CharacterDeleted(inner)
         }
         msg_type::CHARACTER_CREATE_FAILED => {
-            let inner: CharacterCreateFailed = bincode::deserialize(payload)?;
+            let inner: CharacterCreateFailed = deserialize(payload)?;
             ServerMessage::CharacterCreateFailed(inner)
         }
         unknown => return Err(ProtocolError::UnknownMessageType(unknown)),

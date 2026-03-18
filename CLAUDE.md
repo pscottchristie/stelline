@@ -20,7 +20,7 @@ We define our own wire protocol, auth mechanism, and data formats.
 | ECS | hecs | Minimal entity/component storage, no scheduler — we control tick order explicitly |
 | Database | PostgreSQL + sqlx | Async, compile-time SQL query verification |
 | Cache | Redis | Fast ephemeral storage (token blocklist) |
-| Serialization | bincode | Compact packed binary, minimal overhead for high-frequency UDP snapshots |
+| Serialization | rmp-serde (MessagePack) | Named format, cross-language (Godot/Unity/etc.) |
 | Logging | tracing | Structured, async-aware |
 | Pathfinding | Recastnavigation via FFI (or navmesh crate) | Battle-tested nav meshes |
 
@@ -356,7 +356,7 @@ admin         ──► common  (AdminSnapshot only; axum + tokio)
 world         ──► common, game-data (Zone is sync, no Tokio)
               WorldCoordinator ──► common (+ Tokio for async routing)
 game-data     ──► common
-protocol      ──► (serde, bincode only)
+protocol      ──► (serde, rmp-serde only)
 common        ──► (minimal — no game deps)
 ```
 
@@ -399,7 +399,7 @@ pub trait CharacterRepository: Send + Sync {
 ### Phase 1 — Foundation
 - [x] Cargo workspace scaffold (all crates, dependency graph)
 - [x] `common`: EntityId, Vec3, ZoneId, AdminSnapshot primitives
-- [x] `protocol`: packet header (versioned), core message types, bincode serialization
+- [x] `protocol`: packet header (versioned), core message types, MessagePack serialization
 - [x] `world::Zone`: hecs world, tick loop, inbox drain, basic movement, telemetry events
 - [x] `gateway`: TCP listener, session state machine, channel bridge
 - [x] `admin`: axum server, WebSocket push, embedded dashboard HTML/JS

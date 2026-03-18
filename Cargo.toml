@@ -23,7 +23,7 @@ tokio-util = { version = "0.7", features = ["codec"] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
-bincode = "1"
+rmp-serde = "1"
 
 # Error handling
 anyhow = "1"

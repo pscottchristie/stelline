@@ -12,7 +12,6 @@ tracing = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
 bytes = { workspace = true }
-bincode = { workspace = true }
 serde = { workspace = true }
 jsonwebtoken = { workspace = true }
 redis = { workspace = true }
